@@ -12,7 +12,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Export only one user's regular files as ncdu JSON.
 ///
-/// Usage: dume /data > me.json && ncdu -f me.json
+/// Usage: dume /data > dume.json && ncdu -f dume.json
 #[derive(Parser)]
 #[command(version, max_term_width = 100)]
 struct Cli {
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
 
     if cli.merge.is_none() && std::io::stdout().is_terminal() {
         eprintln!(
-            "dume: refusing to write JSON to a terminal; pipe it, e.g. `dume DIR | ncdu -f-` or `dume DIR > me.json`"
+            "dume: refusing to write JSON to a terminal; pipe it, e.g. `dume DIR | ncdu -f-` or `dume DIR > dume.json`"
         );
         return ExitCode::from(2);
     }

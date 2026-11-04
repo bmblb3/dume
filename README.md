@@ -4,7 +4,7 @@ Export **only one user's regular files** as [ncdu](https://dev.yorhel.nl/ncdu) J
 browse "my files" on a shared filesystem. ncdu has no owner filter; this does.
 
 ```sh
-dume /data > me.json && ncdu -f me.json
+dume /data > dume.json && ncdu -f dume.json
 dume /data | ncdu -f-
 ```
 
@@ -30,9 +30,9 @@ dume <DIR> [-j THREADS] [-u UID] [-m FILE] [-v]
 Rescan just the folder you changed instead of the whole tree:
 
 ```sh
-dume /data > me.json
+dume /data > dume.json
 # ...delete stuff in /data/proj/old...
-dume /data/proj/old -m me.json     # seconds, not minutes
+dume /data/proj/old -m dume.json     # seconds, not minutes
 ```
 
 `DIR` must be inside the export's original root and on the same filesystem; the uid is taken
