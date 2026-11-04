@@ -1,6 +1,6 @@
 [package]
 name = "dume"
-version = "0.1.0"
+version = "0.2.0"
 description = "Export only one user's regular files as ncdu JSON"
 license = "MIT"
 edition = "2024"
@@ -10,9 +10,9 @@ clap = { version = "4.6.7", features = ["derive"] }
 mimalloc = "0.1.52"
 rayon = "1.12.0"
 rustix = { version = "1.1.6", features = ["fs", "process"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
-serde_json = "1.0.154"
 tempfile = "3.27.0"
 
 [profile.release]

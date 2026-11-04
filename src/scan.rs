@@ -253,7 +253,29 @@ impl Scan {
         out: &mut impl Write,
         root_name: &str,
         dev: u64,
+        uid: u32,
         progver: &str,
+    ) -> io::Result<()> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut head = Vec::new();
+        write!(head, "[1,2,{{\"progname\":\"dume\",\"progver\":")?;
+        json::push_str(&mut head, progver);
+        write!(head, ",\"uid\":{uid},\"timestamp\":{ts}}},")?;
+        out.write_all(&head)?;
+        self.write_tree(out, root_name, Some(dev))?;
+        out.write_all(b"]\n")?;
+        out.flush()
+    }
+
+    /// Write just the root directory array (no document wrapper).
+    pub fn write_tree(
+        &self,
+        out: &mut impl Write,
+        root_name: &str,
+        dev: Option<u64>,
     ) -> io::Result<()> {
         let n = self.nodes.len();
         // Children always have larger indices than parents, so one reverse pass suffices.
@@ -263,18 +285,11 @@ impl Scan {
                 !self.nodes[i].files.is_empty() || self.nodes[i].subs.iter().any(|&c| keep[c]);
         }
 
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let mut buf = Vec::with_capacity(1 << 20);
-        write!(buf, "[1,2,{{\"progname\":\"dume\",\"progver\":")?;
-        json::push_str(&mut buf, progver);
-        write!(buf, ",\"timestamp\":{ts}}},")?;
 
         // Iterative DFS: (node, next child position).
         let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-        open_dir_entry(&mut buf, root_name.as_bytes(), Some(dev));
+        open_dir_entry(&mut buf, root_name.as_bytes(), dev);
         buf.extend_from_slice(&self.nodes[0].files);
         while let Some(top) = stack.last_mut() {
             let node = &self.nodes[top.0];
@@ -301,9 +316,7 @@ impl Scan {
                 buf.clear();
             }
         }
-        buf.extend_from_slice(b"]\n");
-        out.write_all(&buf)?;
-        out.flush()
+        out.write_all(&buf)
     }
 }
 

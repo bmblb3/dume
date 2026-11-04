@@ -270,3 +270,136 @@ fn ncdu_round_trip() {
     assert!(child.wait().unwrap().success());
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
+
+// ---- --merge ----
+
+fn merge(dir: &std::path::Path, file: &std::path::Path, extra: &[&str]) -> (i32, String) {
+    let mut a = vec![dir.to_str().unwrap(), "-m", file.to_str().unwrap()];
+    a.extend_from_slice(extra);
+    let (c, _, e) = run(&a);
+    (c, e)
+}
+
+fn export(dir: &std::path::Path, file: &std::path::Path) {
+    fs::write(file, run(&[dir.to_str().unwrap()]).1).unwrap();
+}
+
+#[test]
+fn merge_picks_up_adds_changes_and_deletes() {
+    let t = tree();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("me.json");
+    export(t.path(), &f);
+
+    fs::write(t.path().join("a/b/new"), vec![0u8; 9000]).unwrap();
+    fs::remove_file(t.path().join("a/one")).unwrap();
+    fs::create_dir_all(t.path().join("a/fresh/deep")).unwrap();
+    fs::write(t.path().join("a/fresh/deep/f"), b"z").unwrap();
+    fs::write(t.path().join("top.txt"), b"changed outside the merge").unwrap();
+
+    let (c, e) = merge(&t.path().join("a"), &f, &["-j", "2"]);
+    assert_eq!(c, 0, "{e}");
+    let v = parse(&fs::read_to_string(&f).unwrap());
+    assert_eq!(
+        paths(&v),
+        [
+            "a/b/new",
+            "a/b/two \"quoted\"\n",
+            "a/fresh/deep/f",
+            "a/hard",
+            "top.txt"
+        ]
+    );
+    // top.txt is outside the merged subtree, so it keeps its old size.
+    let top = v[3]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "top.txt")
+        .unwrap();
+    assert_eq!(top["asize"], 5);
+    assert_eq!(v[2]["progname"], "dume");
+}
+
+#[test]
+fn merge_prunes_emptied_dirs_and_equals_fresh_scan() {
+    let t = tree();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("me.json");
+    export(t.path(), &f);
+    fs::remove_file(t.path().join("a/b/two \"quoted\"\n")).unwrap();
+    assert_eq!(merge(&t.path().join("a/b"), &f, &[]).0, 0);
+    let v = parse(&fs::read_to_string(&f).unwrap());
+    assert_eq!(paths(&v), ["a/hard", "a/one", "top.txt"]);
+    // Same result as scanning from scratch.
+    assert_eq!(
+        paths(&v),
+        paths(&parse(&run(&[t.path().to_str().unwrap()]).1))
+    );
+}
+
+#[test]
+fn merge_at_root_and_ncdu_accepts_result() {
+    let t = tree();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("me.json");
+    export(t.path(), &f);
+    fs::remove_dir_all(t.path().join("a")).unwrap();
+    assert_eq!(merge(t.path(), &f, &[]).0, 0);
+    let v = parse(&fs::read_to_string(&f).unwrap());
+    assert_eq!(paths(&v), ["top.txt"]);
+    assert_eq!(v[3][0]["name"], t.path().to_str().unwrap());
+    if Command::new("ncdu").arg("--version").output().is_ok() {
+        let o = Command::new("ncdu")
+            .args(["-f"])
+            .arg(&f)
+            .args(["-o", "/dev/null"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+#[test]
+fn merge_rejects_bad_inputs_and_leaves_file_alone() {
+    let t = tree();
+    let other = tree();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("me.json");
+    export(t.path(), &f);
+    let before = fs::read(&f).unwrap();
+
+    // outside the export's root
+    assert_eq!(merge(other.path(), &f, &[]).0, 1);
+    // uid mismatch
+    let wrong = (my_uid() + 1).to_string();
+    let (c, e) = merge(&t.path().join("a"), &f, &["-u", &wrong]);
+    assert_eq!(c, 1);
+    assert!(e.contains("export is for uid"), "{e}");
+    // not a dume export
+    let junk = out.path().join("junk.json");
+    fs::write(&junk, "[1,2,{\"progname\":\"ncdu\"},[{\"name\":\"x\"}]]").unwrap();
+    assert_eq!(merge(t.path(), &junk, &[]).0, 1);
+    fs::write(&junk, "nope").unwrap();
+    assert_eq!(merge(t.path(), &junk, &[]).0, 1);
+    // missing export
+    assert_eq!(merge(t.path(), &out.path().join("none.json"), &[]).0, 1);
+
+    assert_eq!(fs::read(&f).unwrap(), before);
+    assert_eq!(
+        fs::read_dir(out.path()).unwrap().count(),
+        2,
+        "no temp files left"
+    );
+}
+
+#[test]
+fn merge_works_when_stdout_is_a_terminal_free_pipe() {
+    // --merge never writes JSON to stdout.
+    let t = tree();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("me.json");
+    export(t.path(), &f);
+    let (_, stdout, _) = run(&[t.path().to_str().unwrap(), "-m", f.to_str().unwrap()]);
+    assert!(stdout.is_empty());
+}
