@@ -1,0 +1,272 @@
+use serde_json::Value;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, symlink};
+use std::process::{Command, Stdio};
+
+fn dume() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_dume"))
+}
+
+fn my_uid() -> u32 {
+    fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap().uid()
+}
+
+fn run(args: &[&str]) -> (i32, String, String) {
+    let o = dume().args(args).stdin(Stdio::null()).output().unwrap();
+    (
+        o.status.code().unwrap(),
+        String::from_utf8(o.stdout).unwrap(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+/// Names of all files in an ncdu document, as slash-joined paths below the root.
+fn paths(v: &Value) -> Vec<String> {
+    fn walk(dir: &[Value], prefix: &str, out: &mut Vec<String>) {
+        for item in &dir[1..] {
+            match item {
+                Value::Array(a) => {
+                    let n = a[0]["name"].as_str().unwrap();
+                    walk(a, &format!("{prefix}{n}/"), out);
+                }
+                o => out.push(format!("{prefix}{}", o["name"].as_str().unwrap())),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(v[3].as_array().unwrap(), "", &mut out);
+    out.sort();
+    out
+}
+
+fn parse(s: &str) -> Value {
+    serde_json::from_str(s).expect("valid JSON")
+}
+
+fn tree() -> tempfile::TempDir {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    fs::create_dir_all(p.join("a/b")).unwrap();
+    fs::create_dir_all(p.join("empty/deeper")).unwrap();
+    fs::write(p.join("top.txt"), b"hello").unwrap();
+    fs::write(p.join("a/one"), vec![0u8; 5000]).unwrap();
+    fs::write(p.join("a/b/two \"quoted\"\n"), b"x").unwrap();
+    symlink(p.join("top.txt"), p.join("link")).unwrap();
+    symlink(p.join("a"), p.join("dirlink")).unwrap();
+    fs::hard_link(p.join("top.txt"), p.join("a/hard")).unwrap();
+    t
+}
+
+#[test]
+fn lists_own_regular_files_only() {
+    let t = tree();
+    let (code, out, _) = run(&[t.path().to_str().unwrap(), "-j", "4"]);
+    assert_eq!(code, 0);
+    let v = parse(&out);
+    assert_eq!(v[0], 1);
+    assert_eq!(v[1], 2);
+    assert_eq!(v[2]["progname"], "dume");
+    assert_eq!(
+        paths(&v),
+        ["a/b/two \"quoted\"\n", "a/hard", "a/one", "top.txt"],
+        "symlinks skipped, empty dirs pruned"
+    );
+    assert_eq!(v[3][0]["name"], t.path().to_str().unwrap());
+}
+
+#[test]
+fn sizes_and_hardlinks() {
+    let t = tree();
+    let (_, out, _) = run(&[t.path().to_str().unwrap()]);
+    let v = parse(&out);
+    let a = v[3]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x.is_array())
+        .unwrap();
+    let one = a
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "one")
+        .unwrap();
+    assert_eq!(one["asize"], 5000);
+    assert!(one["dsize"].as_u64().unwrap() >= 5000);
+    let hard = a
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "hard")
+        .unwrap();
+    assert_eq!(hard["nlink"], 2);
+    assert_eq!(hard["hlnkc"], true);
+    assert!(one.get("hlnkc").is_none());
+}
+
+#[test]
+fn other_uid_gets_nothing() {
+    let t = tree();
+    let other = (my_uid() + 12345).to_string();
+    let (code, out, _) = run(&[t.path().to_str().unwrap(), "-u", &other]);
+    assert_eq!(code, 0);
+    let v = parse(&out);
+    assert!(paths(&v).is_empty());
+    assert_eq!(v[3].as_array().unwrap().len(), 1, "root only");
+}
+
+#[test]
+fn explicit_uid_matches_default() {
+    let t = tree();
+    let d = t.path().to_str().unwrap();
+    let u = my_uid().to_string();
+    let a = paths(&parse(&run(&[d]).1));
+    let b = paths(&parse(&run(&[d, "--uid", &u]).1));
+    assert_eq!(a, b);
+    assert!(!a.is_empty());
+}
+
+#[test]
+fn non_utf8_names_stay_valid_json() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let t = tempfile::tempdir().unwrap();
+    fs::write(t.path().join(OsStr::from_bytes(b"bad\xff\xfename")), b"x").unwrap();
+    let v = parse(&run(&[t.path().to_str().unwrap()]).1);
+    assert_eq!(paths(&v), ["bad\u{fffd}\u{fffd}name"]);
+}
+
+#[test]
+fn big_directory_uses_parallel_path() {
+    let t = tempfile::tempdir().unwrap();
+    for i in 0..2000 {
+        fs::write(t.path().join(format!("f{i}")), b"").unwrap();
+    }
+    fs::create_dir(t.path().join("sub")).unwrap();
+    fs::write(t.path().join("sub/x"), b"y").unwrap();
+    let (code, out, err) = run(&[t.path().to_str().unwrap(), "-j", "8"]);
+    assert_eq!(code, 0);
+    assert_eq!(paths(&parse(&out)).len(), 2001);
+    assert!(err.contains("2001 files"), "{err}");
+}
+
+#[test]
+fn unreadable_subdir_is_warning_not_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tree();
+    let locked = t.path().join("a/b");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let (code, out, err) = run(&[t.path().to_str().unwrap()]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    parse(&out);
+    if my_uid() != 0 {
+        assert_eq!(code, 0);
+        assert!(err.contains("could not be read"), "{err}");
+    }
+}
+
+#[test]
+fn does_not_follow_root_symlink() {
+    let t = tree();
+    let l = t.path().join("dirlink");
+    let (code, _, err) = run(&[l.to_str().unwrap()]);
+    assert_eq!(code, 1, "{err}");
+}
+
+#[test]
+fn missing_dir_is_runtime_error() {
+    let (code, _, err) = run(&["/nonexistent/dume/path"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("nonexistent"));
+}
+
+#[test]
+fn file_as_root_is_runtime_error() {
+    let t = tree();
+    let (code, ..) = run(&[t.path().join("top.txt").to_str().unwrap()]);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn usage_errors_exit_2() {
+    assert_eq!(run(&[]).0, 2, "DIR is mandatory");
+    assert_eq!(run(&["/tmp", "-j", "0"]).0, 2);
+    assert_eq!(run(&["/tmp", "-j", "abc"]).0, 2);
+    assert_eq!(run(&["/tmp", "--bogus"]).0, 2);
+    assert_eq!(run(&["/tmp", "-u", "-1"]).0, 2);
+}
+
+#[test]
+fn help_and_version_exit_0() {
+    assert_eq!(run(&["--help"]).0, 0);
+    assert_eq!(run(&["--version"]).0, 0);
+}
+
+#[test]
+fn refuses_terminal_stdout() {
+    // Give the child a pty as stdout via `script`; skip if unavailable.
+    let Ok(sh) = Command::new("script").arg("--version").output() else {
+        return;
+    };
+    if !sh.status.success() {
+        return;
+    }
+    let t = tree();
+    let cmd = format!("{} {}", env!("CARGO_BIN_EXE_dume"), t.path().display());
+    let o = Command::new("script")
+        .args(["-qec", &format!("{cmd}; echo EXIT=$?"), "/dev/null"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(s.contains("refusing to write JSON to a terminal"), "{s}");
+    assert!(s.contains("EXIT=2"), "{s}");
+    assert!(!s.contains("progname"), "{s}");
+}
+
+#[test]
+fn ncdu_round_trip() {
+    let have = Command::new("ncdu").arg("--version").output().is_ok();
+    if !have {
+        assert!(
+            std::env::var_os("DUME_REQUIRE_NCDU").is_none(),
+            "ncdu required but not installed"
+        );
+        eprintln!("ncdu not installed; skipping");
+        return;
+    }
+    let t = tree();
+    let (_, json, _) = run(&[t.path().to_str().unwrap()]);
+    let dir = tempfile::tempdir().unwrap();
+    let inp = dir.path().join("me.json");
+    let outp = dir.path().join("re.json");
+    fs::write(&inp, &json).unwrap();
+    let o = Command::new("ncdu")
+        .arg("-f")
+        .arg(&inp)
+        .arg("-o")
+        .arg(&outp)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "ncdu rejected export: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // ncdu's re-export must contain the same files.
+    assert_eq!(
+        paths(&parse(&fs::read_to_string(&outp).unwrap())),
+        paths(&parse(&json))
+    );
+
+    // And piping via stdin works too.
+    let mut child = dume().arg(t.path()).stdout(Stdio::piped()).spawn().unwrap();
+    let o = Command::new("ncdu")
+        .args(["-f-", "-o"])
+        .arg(&outp)
+        .stdin(child.stdout.take().unwrap())
+        .output()
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}

@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl toolchain and ncdu
+        run: sudo apt-get update && sudo apt-get install -y musl-tools ncdu file
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Verify binary is fully static
+        run: |
+          bin="target/$TARGET/release/dume"
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -vq -E 'not a dynamic executable|statically linked'; then
+            echo "binary is dynamically linked"; ldd "$bin"; exit 1
+          fi
+      - name: Smoke test with ncdu
+        run: |
+          bin="target/$TARGET/release/dume"
+          "$bin" --version
+          "$bin" . | ncdu -f- -o /dev/null
+      - name: Package
+        run: |
+          name="dume-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir "$name"
+          cp "target/$TARGET/release/dume" README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dume-*.tar.gz
+            dume-*.tar.gz.sha256
+          generate_release_notes: true
