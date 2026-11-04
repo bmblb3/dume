@@ -1,5 +1,6 @@
 mod json;
 mod merge;
+mod report;
 mod scan;
 
 use clap::Parser;
@@ -27,6 +28,12 @@ struct Cli {
     /// Rescan DIR (a directory inside an existing export) and splice it into FILE in place
     #[arg(short, long, value_name = "FILE")]
     merge: Option<PathBuf>,
+    /// Don't scan: print what's taking space under DIR (a directory inside an existing export)
+    #[arg(short, long, value_name = "FILE", conflicts_with = "merge")]
+    report: Option<PathBuf>,
+    /// Rows per section in --report
+    #[arg(short = 'n', long, default_value_t = 15, requires = "report")]
+    top: usize,
     /// Print each unreadable path to stderr (default: only a count)
     #[arg(short, long)]
     verbose: bool,
@@ -36,7 +43,7 @@ fn main() -> ExitCode {
     // clap exits with 2 on usage errors.
     let cli = Cli::parse();
 
-    if cli.merge.is_none() && std::io::stdout().is_terminal() {
+    if cli.merge.is_none() && cli.report.is_none() && std::io::stdout().is_terminal() {
         eprintln!(
             "dume: refusing to write JSON to a terminal; pipe it, e.g. `dume DIR | ncdu -f-` or `dume DIR > dume.json`"
         );
@@ -56,6 +63,16 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> std::io::Result<()> {
     let err = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
+    if let Some(file) = &cli.report {
+        let export = merge::Export::load(file)?;
+        let rel = export.relative(&cli.dir.canonicalize()?)?;
+        return report::run(
+            export.subtree(&rel)?,
+            &cli.dir.to_string_lossy(),
+            cli.top,
+            &mut std::io::stdout().lock(),
+        );
+    }
     let mut export = cli.merge.as_deref().map(merge::Export::load).transpose()?;
     let file_uid = export.as_ref().map(|e| e.uid()).transpose()?;
     if let (Some(a), Some(b)) = (cli.uid, file_uid)

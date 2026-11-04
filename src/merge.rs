@@ -62,6 +62,17 @@ impl Export {
             .collect())
     }
 
+    /// The directory array at `rel` (first element is its own info).
+    pub fn subtree(&self, rel: &[String]) -> io::Result<&[Value]> {
+        let mut dir = self.doc[3].as_array().unwrap().as_slice();
+        for name in rel {
+            let i = find(dir, name)
+                .ok_or_else(|| err(format!("{} is not in the export", rel.join("/"))))?;
+            dir = dir[i].as_array().unwrap();
+        }
+        Ok(dir)
+    }
+
     /// Swap in `tree` (a freshly scanned directory array) at `rel`.
     pub fn splice(&mut self, rel: &[String], tree: Value, timestamp: u64) {
         let root = self.doc[3].as_array_mut().unwrap();

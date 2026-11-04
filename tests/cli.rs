@@ -403,3 +403,102 @@ fn merge_works_when_stdout_is_a_terminal_free_pipe() {
     let (_, stdout, _) = run(&[t.path().to_str().unwrap(), "-m", f.to_str().unwrap()]);
     assert!(stdout.is_empty());
 }
+
+// ---- --report ----
+
+fn report_tree() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    for i in 0..5 {
+        let d = p.join(format!("proj/run_{i:04}"));
+        fs::create_dir_all(d.join("node_modules/node_modules")).unwrap();
+        fs::write(d.join("out.log"), vec![0u8; 8192]).unwrap();
+        fs::write(d.join("node_modules/a.js"), vec![0u8; 4096]).unwrap();
+        fs::write(d.join("node_modules/node_modules/b.js"), vec![0u8; 4096]).unwrap();
+    }
+    fs::create_dir_all(p.join("other")).unwrap();
+    fs::write(p.join("other/big.bin"), vec![1u8; 1 << 20]).unwrap();
+    fs::hard_link(p.join("other/big.bin"), p.join("other/big2.bin")).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("dume.json");
+    export(p, &f);
+    (t, out, f)
+}
+
+fn report(dir: &std::path::Path, f: &std::path::Path, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![dir.to_str().unwrap(), "-r", f.to_str().unwrap()];
+    a.extend_from_slice(extra);
+    run(&a)
+}
+
+/// The row for `pattern` in the report, split on whitespace.
+fn row<'a>(out: &'a str, pattern: &str) -> Vec<&'a str> {
+    out.lines()
+        .find(|l| l.trim_start().starts_with(pattern))
+        .unwrap_or_else(|| panic!("no row {pattern}:\n{out}"))
+        .split_whitespace()
+        .collect()
+}
+
+#[test]
+fn report_groups_derived_patterns() {
+    let (t, _o, f) = report_tree();
+    let (code, out, err) = report(t.path(), &f, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("hardlinks once"), "{out}");
+    // 5 run dirs collapse into one derived pattern.
+    assert_eq!(row(&out, "run_#")[1], "5", "{out}");
+    // Nested node_modules is only counted at the outermost level: 5, not 10.
+    assert_eq!(row(&out, "node_modules")[1], "5", "{out}");
+    // File patterns come from extensions.
+    assert_eq!(row(&out, "*.log")[1], "5", "{out}");
+    assert_eq!(row(&out, "*.js")[1], "10", "{out}");
+    // Hardlinked 1 MiB counted once: total is well under 2 MiB.
+    assert!(out.lines().next().unwrap().contains("1."), "{out}");
+    assert!(out.contains("BIGGEST DIRECTORIES"), "{out}");
+}
+
+#[test]
+fn report_on_subdir_and_top_limit() {
+    let (t, _o, f) = report_tree();
+    let (code, out, _) = report(&t.path().join("proj"), &f, &["-n", "1"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("big.bin"), "only proj is analysed:\n{out}");
+    let dirs_section: Vec<_> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("DIRECTORY"))
+        .skip(2)
+        .take_while(|l| !l.is_empty())
+        .collect();
+    assert_eq!(dirs_section.len(), 1, "-n 1 limits rows:\n{out}");
+}
+
+#[test]
+fn report_ignores_rare_names_and_errors_cleanly() {
+    let (t, _o, f) = report_tree();
+    let (_, out, _) = report(t.path(), &f, &[]);
+    assert!(
+        !out.contains("other  "),
+        "single dirs are not patterns:\n{out}"
+    );
+    // dir that exists on disk but not in the export
+    fs::create_dir(t.path().join("unlisted")).unwrap();
+    assert_eq!(report(&t.path().join("unlisted"), &f, &[]).0, 1);
+    // outside the export root
+    let other = tempfile::tempdir().unwrap();
+    assert_eq!(report(other.path(), &f, &[]).0, 1);
+    // flags that make no sense together
+    let (c, ..) = run(&[
+        t.path().to_str().unwrap(),
+        "-r",
+        f.to_str().unwrap(),
+        "-m",
+        f.to_str().unwrap(),
+    ]);
+    assert_eq!(c, 2);
+    assert_eq!(
+        run(&[t.path().to_str().unwrap(), "-n", "3"]).0,
+        2,
+        "-n needs --report"
+    );
+}

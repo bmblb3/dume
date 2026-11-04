@@ -1,6 +1,6 @@
 [package]
 name = "dume"
-version = "0.2.0"
+version = "0.3.0"
 description = "Export only one user's regular files as ncdu JSON"
 license = "MIT"
 edition = "2024"

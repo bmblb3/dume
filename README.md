@@ -11,7 +11,7 @@ dume /data | ncdu -f-
 ## Usage
 
 ```
-dume <DIR> [-j THREADS] [-u UID] [-m FILE] [-v]
+dume <DIR> [-j THREADS] [-u UID] [-m FILE | -r FILE [-n N]] [-v]
 ```
 
 | flag | default | meaning |
@@ -19,6 +19,8 @@ dume <DIR> [-j THREADS] [-u UID] [-m FILE] [-v]
 | `-j, --threads` | 32 | concurrent threads (NFS is latency-bound; more in-flight stats = faster) |
 | `-u, --uid` | your uid | owner to keep |
 | `-m, --merge FILE` | off | rescan `DIR` and splice it into an existing export, in place |
+| `-r, --report FILE` | off | no scan: print what takes space under `DIR`, derived from an export |
+| `-n, --top` | 15 | rows per `--report` section |
 | `-v, --verbose` | off | print each unreadable path (default: just a count) |
 
 - `DIR` is required. Refuses to write to a terminal (exit 2).
@@ -38,6 +40,23 @@ dume /data/proj/old -m dume.json     # seconds, not minutes
 `DIR` must be inside the export's original root and on the same filesystem; the uid is taken
 from the file. Emptied directories are pruned. The file is replaced atomically. Changes
 outside `DIR` are not seen. Directory nesting deeper than ~120 levels fails to load (JSON parser limit).
+
+## Finding what to clean
+
+```sh
+dume /data/proj -r dume.json          # reads dume.json, no scan
+```
+
+Prints, for `DIR` (any directory inside the export):
+
+- **Directory patterns**: names are normalised (`run_0042` -> `run_#`, long hex -> `<hex>`) and grouped,
+  so repeated kinds of directory show up with count, total size and the largest example. Only
+  the outermost match is counted; different patterns can overlap, so `%` needn't add to 100.
+- **File patterns**: by extension (`*.log`, `*.pyc`) or normalised name.
+- **Biggest directories**, skipping parents that are ≥90% one child.
+
+Patterns are derived from your data (nothing is hard-coded) and shown only if seen 3+ times.
+Sizes are disk usage, hardlinks counted once. There is no age information: the export has no mtimes.
 
 ## Behaviour
 
