@@ -648,8 +648,13 @@ pub fn refresh(
 
 fn replace(tx: &Connection, rel: &[u8], scan: Option<&Scan>) -> io::Result<()> {
     // Subtree at `rel`; the empty path means everything.
-    const UNDER: &str = "(?1=x'' OR path=?1 OR (path>=?2 AND path<?3))";
+    // Root and subtree get different predicates: an OR with `?1=x''` forces a full table scan.
     let (lo, hi) = ([rel, b"/"].concat(), [rel, b"0"].concat());
+    let (under, ps): (&str, Vec<&dyn rusqlite::ToSql>) = if rel.is_empty() {
+        ("1", vec![])
+    } else {
+        ("(path=?1 OR (path>=?2 AND path<?3))", vec![&rel, &lo, &hi])
+    };
     let old: i64 = tx
         .query_row(
             "SELECT COALESCE(SUM(tree_size),0) FROM entries WHERE path=?",
@@ -662,18 +667,15 @@ fn replace(tx: &Connection, rel: &[u8], scan: Option<&Scan>) -> io::Result<()> {
     // still has links outside; promote one of those so the total stays right.
     let counted: Vec<i64> = {
         let mut st = tx
-            .prepare(&format!("SELECT DISTINCT ino FROM entries WHERE is_dir=0 AND nlink>1 AND tree_size>0 AND {UNDER}"))
+            .prepare(&format!("SELECT DISTINCT ino FROM entries WHERE is_dir=0 AND nlink>1 AND tree_size>0 AND {under}"))
             .map_err(err)?;
-        st.query_map(params![rel, lo, hi], |r| r.get(0))
+        st.query_map(ps.as_slice(), |r| r.get(0))
             .map_err(err)?
             .collect::<Result<_, _>>()
             .map_err(err)?
     };
-    tx.execute(
-        &format!("DELETE FROM entries WHERE {UNDER}"),
-        params![rel, lo, hi],
-    )
-    .map_err(err)?;
+    tx.execute(&format!("DELETE FROM entries WHERE {under}"), ps.as_slice())
+        .map_err(err)?;
     adjust(tx, rel, -old)?;
     for ino in counted {
         let top: Option<(Vec<u8>, i64, i64)> = tx
