@@ -6,6 +6,7 @@ pub mod db;
 pub mod json;
 pub mod layout;
 pub mod merge;
+pub mod recipe;
 pub mod report;
 pub mod scan;
 pub mod tui;
