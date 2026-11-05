@@ -15,8 +15,8 @@ dume proj/sub
 
 First run: *"You have no scan yet. Scan now?"* Later runs: *"Found your scan, made 3 days ago:
 browse it / rescan everything?"* Your scan is a SQLite database, `~/.local/state/dume/dume.db`
-(`$XDG_STATE_HOME`, or `-f` / `$DUME_DB`). If you have a `dume.json` from an older version, dume offers
-to import it.
+(`$XDG_STATE_HOME`, or `-f` / `$DUME_DB`). If you have a `dume.json` from an older version (0.6 kept it at
+`~/.local/state/dume/dume.json` or `$DUME_JSON`; earlier ones at `~/dume.json`), dume offers to import it.
 
 **Where** is the main view: the subdirectories of the current directory, biggest first, ncdu-style.
 `enter` goes into one, `backspace` (or `h`, `u`, `esc`) goes up, `q` quits.
@@ -57,19 +57,24 @@ writable by admins only.
 A `*.sql` file in `share/dume/actions/`. The leading comment block is the header and must come first:
 
 ```sql
--- dume-name: OpenFOAM leftovers          (required)
--- dume-apply: delete                     (default) or a script in the same directory
+-- dume-name: OpenFOAM leftovers
+-- dume-apply: delete
 SELECT path FROM entries
-WHERE name REGEXP '^[0-9]+$|^(polyMesh|dynamicCode)$|^processor[0-9]*$|^core'
+WHERE name REGEXP '^([1-9][0-9]*|[0-9]*\.[0-9]+([eE]-?[0-9]+)?|[0-9]+[eE]-?[0-9]+)$'
+   OR name REGEXP '^(polyMesh|dynamicCode)$|^processor[0-9]*$|^core(\.[0-9]+)?$'
 ```
+
+`dume-name` is required. `dume-apply` is `delete` (the default) or a script in the same directory. This
+example selects OpenFOAM time folders (`100`, `0.5`, `1e-05`, but never `0`, which holds the case inputs),
+`polyMesh`, `dynamicCode`, `processor*` and core files.
 
 The query runs read-only on the user's database, limited to the folder being cleaned, and must return a
 `path` column. It has a 30 s limit. The view is `entries(path, parent, name, is_dir, asize, dsize, ino,
 nlink, mtime, tree_size)`. **`path` and `name` are BLOBs**, so `name = 'foo'` never matches: use `REGEXP`
 (or `CAST(name AS TEXT)`). Paths inside an already selected directory are dropped.
 
-- `delete` (default): removes each ticked path, through directory fds. It never leaves the folder or
-  crosses filesystems.
+- `delete` (default): removes each ticked path, through directory fds. It never leaves the folder, crosses
+  filesystems, or touches files owned by other people (folders holding them are kept).
 - `-- dume-apply: script.sh`: runs the script (a regular file next to the recipe, mode 0755) once per
   ticked path, with `$1` = the path and cwd = the folder being cleaned. `PREFIX/bin` is first on `PATH`;
   `DUME_HERE` is the folder and `DUME_PATH` the path. Output is captured; failures are listed at the end.

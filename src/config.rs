@@ -93,9 +93,10 @@ pub fn db_path(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String
     state_file(env, "DUME_DB", "dume.db")
 }
 
-/// Where earlier versions kept the export.
+/// Where earlier versions kept the export: 0.6's [`export_path`] if it exists, else `~/dume.json`.
 pub fn legacy_export(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    env("HOME").map(|h| PathBuf::from(h).join("dume.json"))
+    let home = env("HOME").map(|h| PathBuf::from(h).join("dume.json"));
+    export_path(&env).ok().filter(|p| p.is_file()).or(home)
 }
 
 #[cfg(test)]
@@ -151,6 +152,27 @@ mod tests {
         assert_eq!(
             legacy_export(env(&[("HOME", "/h")])),
             Some("/h/dume.json".into())
+        );
+    }
+
+    #[test]
+    fn legacy_export_prefers_the_0_6_location() {
+        let t = tempfile::tempdir().unwrap();
+        let h = t.path().to_str().unwrap();
+        let old = t.path().join(".local/state/dume/dume.json");
+        assert_eq!(
+            legacy_export(env(&[("HOME", h)])),
+            Some(t.path().join("dume.json"))
+        );
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "[]").unwrap();
+        assert_eq!(legacy_export(env(&[("HOME", h)])), Some(old));
+        let j = t.path().join("j.json");
+        std::fs::write(&j, "[]").unwrap();
+        let js = j.to_str().unwrap();
+        assert_eq!(
+            legacy_export(env(&[("HOME", h), ("DUME_JSON", js)])),
+            Some(j)
         );
     }
 

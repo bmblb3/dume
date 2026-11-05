@@ -437,11 +437,22 @@ impl App {
     }
 
     fn go_up(&mut self) {
-        let Some((root, sel)) = self.stack.pop() else {
-            return;
-        };
-        (self.root, self.sel, self.offset) = (root, sel, 0);
-        self.load();
+        if let Some((root, sel)) = self.stack.pop() {
+            (self.root, self.sel, self.offset) = (root, sel, 0);
+            self.load();
+        } else if self.root != self.scan_root && self.root.starts_with(&self.scan_root) {
+            // Above the launch directory: select the folder we came from.
+            let from = self.root.file_name().map(|n| n.as_bytes().to_vec());
+            self.root.pop();
+            (self.sel, self.offset) = (0, 0);
+            self.load();
+            let from = from.unwrap_or_default();
+            self.sel = self
+                .children
+                .iter()
+                .position(|c| c.name == from)
+                .unwrap_or(0);
+        }
     }
 
     fn breadcrumb(&self) -> String {

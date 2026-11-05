@@ -108,7 +108,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             app.tick();
             redraw |= app.mode != before;
             if std::mem::take(&mut app.want_ncdu) {
-                let json = db.with_file_name("dume.ncdu.json");
+                let json = db.with_file_name(format!("dume.ncdu.{}.json", std::process::id()));
                 ratatui::restore();
                 let res = ncdu(&app, &layout.bin, &json);
                 let _ = std::fs::remove_file(&json);

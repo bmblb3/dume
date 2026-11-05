@@ -1,4 +1,4 @@
-//! Shared code for the `dume` and `dumecl` binaries.
+//! Shared code for the `dume` and `dume-scan` binaries.
 
 pub mod apply;
 pub mod config;

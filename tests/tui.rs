@@ -151,6 +151,20 @@ fn where_drills_in_and_up() {
     assert!(a.quit);
 }
 
+#[test]
+fn going_up_from_launch_directory_stops_at_scan_root() {
+    let e = env();
+    let mut a = App::new(e.db.clone(), e.root.join("proj/case_1"), vec![], 2);
+    key(&mut a, KeyCode::Char('h'));
+    assert_eq!(a.root, e.root.join("proj"));
+    // The child we came from is selected (case_1 is second largest).
+    assert_eq!(a.selected(), 1);
+    key(&mut a, KeyCode::Left);
+    assert_eq!(a.root, e.root);
+    key(&mut a, KeyCode::Char('h'));
+    assert_eq!(a.root, e.root, "never above the scan root");
+}
+
 // ---- start-up ----
 
 #[test]

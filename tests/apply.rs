@@ -1,4 +1,4 @@
-use dumelib::apply::{Verdict, check, delete, run};
+use dumelib::apply::{Verdict, check, check_as, delete, run};
 use dumelib::recipe::{Apply, Hit, Recipe};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -330,8 +330,8 @@ fn parent_swapped_for_symlink_after_guard_does_not_delete_outside() {
     let dd = check(&root, &here, &hit(&root, "h/p/d")).unwrap();
     fs::rename(here.join("p"), here.join("p.old")).unwrap();
     symlink(&outside, here.join("p")).unwrap();
-    assert_eq!(delete(&fx, &|_, d| d), Verdict::Done);
-    assert_eq!(delete(&dd, &|_, d| d), Verdict::Done);
+    assert_eq!(delete(&fx, &|_, _| {}), Verdict::Done);
+    assert_eq!(delete(&dd, &|_, _| {}), Verdict::Done);
     assert!(
         outside.join("x").exists(),
         "deleted through a swapped parent"
@@ -354,13 +354,65 @@ fn mount_point_or_other_device_is_not_crossed() {
     put(&here.join("d/mnt/inside"));
     put(&here.join("d/g"));
     let c = check(&root, &here, &hit(&root, "h/d")).unwrap();
-    let v = delete(&c, &|name, dev| if name == "mnt" { dev + 1 } else { dev });
+    let v = delete(&c, &|name, st| {
+        if name == "mnt" {
+            st.st_dev += 1
+        }
+    });
     assert_eq!(v, Verdict::Failed("contains a mount point: mnt".into()));
     assert!(
         here.join("d/mnt/inside").exists(),
         "crossed into another device"
     );
     assert!(!here.join("d/a").exists() && !here.join("d/g").exists());
+}
+
+/// Tests can't chown, so the owner of each entry is overridden: `theirs` (a file) and
+/// `shared` (a folder) belong to someone else. They and their parents stay; the rest goes.
+#[test]
+fn other_peoples_files_are_left_alone() {
+    let (_t, root, here) = tree();
+    put(&here.join("d/a/theirs"));
+    put(&here.join("d/a/mine"));
+    put(&here.join("d/shared/x"));
+    put(&here.join("d/g"));
+    let c = check(&root, &here, &hit(&root, "h/d")).unwrap();
+    let v = delete(&c, &|name, st| {
+        if name == "theirs" || name == "shared" {
+            st.st_uid += 1
+        }
+    });
+    assert_eq!(
+        v,
+        Verdict::Failed("contains files owned by other people: a/theirs".into())
+    );
+    assert!(here.join("d/a/theirs").exists() && here.join("d/shared/x").exists());
+    assert!(!here.join("d/a/mine").exists() && !here.join("d/g").exists());
+}
+
+#[test]
+fn hit_owned_by_someone_else_is_skipped() {
+    let (_t, root, here) = tree();
+    put(&here.join("f"));
+    let me = rustix::process::getuid().as_raw();
+    let why = check_as(&root, &here, &hit(&root, "h/f"), me + 1)
+        .err()
+        .unwrap();
+    assert_eq!(why, "is owned by someone else");
+    assert!(check_as(&root, &here, &hit(&root, "h/f"), me).is_ok());
+}
+
+#[test]
+fn too_deep_a_tree_fails_plainly() {
+    let (_t, root, here) = tree();
+    let deep: PathBuf = std::iter::repeat_n("a", 300).collect();
+    put(&here.join("d").join(&deep).join("f"));
+    let c = check(&root, &here, &hit(&root, "h/d")).unwrap();
+    assert_eq!(
+        delete(&c, &|_, _| {}),
+        Verdict::Failed("folder is nested too deeply".into())
+    );
+    assert!(here.join("d").exists());
 }
 
 #[test]

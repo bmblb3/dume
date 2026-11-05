@@ -55,7 +55,7 @@ pub fn run(
             match check(root, here, hit) {
                 Err(why) => Verdict::Skipped(why),
                 Ok(c) => match &recipe.apply {
-                    Apply::Delete => delete(&c, &|_, d| d),
+                    Apply::Delete => delete(&c, &|_, _| {}),
                     Apply::Script(s) => script(s, here, &c.target, bin),
                 },
             }
@@ -74,6 +74,8 @@ pub struct Checked {
     target: PathBuf,
     is_dir: bool,
     dev: u64,
+    /// The uid whose files may be deleted (the process's own).
+    me: u32,
 }
 
 const DIR: OFlags = OFlags::RDONLY
@@ -103,6 +105,12 @@ fn open_dir(fd: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Errno> {
 /// Exposed for tests: the checks of [`run`], keeping the fds for [`delete`].
 #[doc(hidden)]
 pub fn check(root: &Path, here: &Path, hit: &Hit) -> Result<Checked, String> {
+    check_as(root, here, hit, rustix::process::getuid().as_raw())
+}
+
+/// [`check`] as if the process were uid `me` (tests can't chown).
+#[doc(hidden)]
+pub fn check_as(root: &Path, here: &Path, hit: &Hit, me: u32) -> Result<Checked, String> {
     let rel = Path::new(OsStr::from_bytes(&hit.path));
     // `join` would replace `root` with an absolute path, and `..` could climb out.
     if hit.path.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
@@ -138,6 +146,9 @@ pub fn check(root: &Path, here: &Path, hit: &Hit) -> Result<Checked, String> {
     if st.st_dev as u64 != dev {
         return Err("is on another filesystem".into());
     }
+    if st.st_uid != me {
+        return Err("is owned by someone else".into());
+    }
     // Directories: the rescan before cleaning is the freshness guarantee.
     if !hit.is_dir && hit.mtime.is_some_and(|m| st.st_mtime as u64 != m) {
         return Err("changed since the scan".into());
@@ -148,29 +159,45 @@ pub fn check(root: &Path, here: &Path, hit: &Hit) -> Result<Checked, String> {
         target,
         is_dir: hit.is_dir,
         dev,
+        me,
     })
 }
 
-/// Exposed for tests: delete a checked hit. `dev_of(name, st_dev)` gives an entry's device
-/// (identity in [`run`]; tests override it because they can't mount).
+/// Exposed for tests: delete a checked hit. `fix(name, stat)` may alter an entry's stat
+/// (a no-op in [`run`]; tests set `st_dev`/`st_uid` because they can't mount or chown).
 #[doc(hidden)]
-pub fn delete(c: &Checked, dev_of: &dyn Fn(&OsStr, u64) -> u64) -> Verdict {
-    let fail = |e: Errno| Verdict::Failed(std::io::Error::from(e).to_string());
+pub fn delete(c: &Checked, fix: &dyn Fn(&OsStr, &mut Stat)) -> Verdict {
+    let fail = |e: Errno| {
+        Verdict::Failed(match e {
+            Errno::NAMETOOLONG => "folder is nested too deeply".into(),
+            e => std::io::Error::from(e).to_string(),
+        })
+    };
     if !c.is_dir {
         return match rustix::fs::unlinkat(&c.parent, &c.leaf, AtFlags::empty()) {
             Ok(()) => Verdict::Done,
             Err(e) => fail(e),
         };
     }
-    let mut mounts = Vec::new();
+    let mut kept = Kept::default();
     let r = rustix::fs::openat(&c.parent, &c.leaf, DIR, Mode::empty())
-        .and_then(|fd| empty(&fd, c.dev, &PathBuf::new(), &mut mounts, dev_of));
+        .and_then(|fd| empty(&fd, c, &PathBuf::new(), &mut kept, fix, 0));
     if let Err(e) = r {
         return fail(e);
     }
-    if !mounts.is_empty() {
-        let names: Vec<_> = mounts.iter().map(|m| m.display().to_string()).collect();
+    if !kept.mounts.is_empty() {
+        let names: Vec<_> = kept
+            .mounts
+            .iter()
+            .map(|m| m.display().to_string())
+            .collect();
         return Verdict::Failed(format!("contains a mount point: {}", names.join(", ")));
+    }
+    if let Some(first) = kept.theirs.first() {
+        return Verdict::Failed(format!(
+            "contains files owned by other people: {}",
+            first.display()
+        ));
     }
     match rustix::fs::unlinkat(&c.parent, &c.leaf, AtFlags::REMOVEDIR) {
         Ok(()) => Verdict::Done,
@@ -178,17 +205,31 @@ pub fn delete(c: &Checked, dev_of: &dyn Fn(&OsStr, u64) -> u64) -> Verdict {
     }
 }
 
-/// Remove everything in the directory `fd` that is on `dev`; subdirectories on another
-/// device are left alone and recorded in `mounts` (relative to the deleted directory).
-// shortcut: one fd and one recursion level per depth, so a tree deeper than the fd limit
-// fails with EMFILE (reported, nothing unsafe); switch to an explicit stack if that matters.
+/// What [`empty`] left in place, relative to the deleted directory.
+#[derive(Default)]
+struct Kept {
+    /// Subdirectories on another device.
+    mounts: Vec<PathBuf>,
+    /// Entries owned by another uid (the scan never showed them to the user).
+    theirs: Vec<PathBuf>,
+}
+
+/// Deeper than this, [`empty`] gives up with `NAMETOOLONG` (one open fd per level).
+const MAX_DEPTH: usize = 256;
+
+/// Remove everything in the directory `fd` that is on `c.dev` and owned by `c.me`; the rest
+/// is left alone, recorded in `kept`, and its parent directories are kept too.
 fn empty(
     fd: &OwnedFd,
-    dev: u64,
+    c: &Checked,
     at: &Path,
-    mounts: &mut Vec<PathBuf>,
-    dev_of: &dyn Fn(&OsStr, u64) -> u64,
+    kept: &mut Kept,
+    fix: &dyn Fn(&OsStr, &mut Stat),
+    depth: usize,
 ) -> Result<(), Errno> {
+    if depth >= MAX_DEPTH {
+        return Err(Errno::NAMETOOLONG);
+    }
     // Names first: deleting while reading a directory can skip entries on NFS.
     let mut names = Vec::new();
     for ent in Dir::read_from(fd)? {
@@ -198,20 +239,25 @@ fn empty(
         }
     }
     for name in names {
-        let st: Stat = rustix::fs::statat(fd, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let mut st: Stat = rustix::fs::statat(fd, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+        fix(&name, &mut st);
+        let path = at.join(&name);
+        if st.st_uid != c.me {
+            kept.theirs.push(path);
+            continue;
+        }
         if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
             rustix::fs::unlinkat(fd, &name, AtFlags::empty())?;
             continue;
         }
-        let path = at.join(&name);
-        if dev_of(&name, st.st_dev as u64) != dev {
-            mounts.push(path);
+        if st.st_dev as u64 != c.dev {
+            kept.mounts.push(path);
             continue;
         }
-        let before = mounts.len();
+        let before = kept.mounts.len() + kept.theirs.len();
         let sub = rustix::fs::openat(fd, &name, DIR, Mode::empty())?;
-        empty(&sub, dev, &path, mounts, dev_of)?;
-        if mounts.len() == before {
+        empty(&sub, c, &path, kept, fix, depth + 1)?;
+        if kept.mounts.len() + kept.theirs.len() == before {
             rustix::fs::unlinkat(fd, &name, AtFlags::REMOVEDIR)?;
         }
     }

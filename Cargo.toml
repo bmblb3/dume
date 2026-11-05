@@ -1,7 +1,7 @@
 [package]
 name = "dume"
 version = "0.7.0"
-description = "Export only one user's regular files as ncdu JSON"
+description = "Scan one user's files into SQLite, browse them ncdu-style, and clean them with recipes"
 license = "MIT"
 edition = "2024"
 

@@ -266,10 +266,16 @@ fn shipped_examples_parse() {
         .iter()
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect();
-    let want: std::collections::BTreeSet<String> =
-        ["0", "100", "processor0", "constant/polyMesh", "core.123"]
-            .map(String::from)
-            .into();
+    let want: std::collections::BTreeSet<String> = [
+        "100",
+        "0.5",
+        "1e-05",
+        "processor0",
+        "constant/polyMesh",
+        "core.123",
+    ]
+    .map(String::from)
+    .into();
     assert_eq!(got, want);
 }
 
@@ -278,7 +284,10 @@ fn foam_small() -> (tempfile::TempDir, PathBuf, Db) {
     let root = t.path().join("r");
     for f in [
         "0/U",
+        "0.orig/U",
         "100/U",
+        "0.5/U",
+        "1e-05/U",
         "processor0/0/U",
         "constant/polyMesh/points",
         "constant/transportProperties",
