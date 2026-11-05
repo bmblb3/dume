@@ -281,14 +281,22 @@ fn merge(dir: &std::path::Path, file: &std::path::Path, extra: &[&str]) -> (i32,
 }
 
 fn export(dir: &std::path::Path, file: &std::path::Path) {
-    fs::write(file, run(&[dir.to_str().unwrap()]).1).unwrap();
+    let (c, _, e) = run(&[dir.to_str().unwrap(), "-o", file.to_str().unwrap()]);
+    assert_eq!(c, 0, "{e}");
+}
+
+/// The database's ncdu JSON, parsed.
+fn db_json(file: &std::path::Path) -> Value {
+    let (c, out, e) = run(&["--json", file.to_str().unwrap()]);
+    assert_eq!(c, 0, "{e}");
+    parse(&out)
 }
 
 #[test]
 fn merge_picks_up_adds_changes_and_deletes() {
     let t = tree();
     let out = tempfile::tempdir().unwrap();
-    let f = out.path().join("me.json");
+    let f = out.path().join("me.db");
     export(t.path(), &f);
 
     fs::write(t.path().join("a/b/new"), vec![0u8; 9000]).unwrap();
@@ -299,7 +307,7 @@ fn merge_picks_up_adds_changes_and_deletes() {
 
     let (c, e) = merge(&t.path().join("a"), &f, &["-j", "2"]);
     assert_eq!(c, 0, "{e}");
-    let v = parse(&fs::read_to_string(&f).unwrap());
+    let v = db_json(&f);
     assert_eq!(
         paths(&v),
         [
@@ -325,11 +333,11 @@ fn merge_picks_up_adds_changes_and_deletes() {
 fn merge_prunes_emptied_dirs_and_equals_fresh_scan() {
     let t = tree();
     let out = tempfile::tempdir().unwrap();
-    let f = out.path().join("me.json");
+    let f = out.path().join("me.db");
     export(t.path(), &f);
     fs::remove_file(t.path().join("a/b/two \"quoted\"\n")).unwrap();
     assert_eq!(merge(&t.path().join("a/b"), &f, &[]).0, 0);
-    let v = parse(&fs::read_to_string(&f).unwrap());
+    let v = db_json(&f);
     assert_eq!(paths(&v), ["a/hard", "a/one", "top.txt"]);
     // Same result as scanning from scratch.
     assert_eq!(
@@ -342,11 +350,11 @@ fn merge_prunes_emptied_dirs_and_equals_fresh_scan() {
 fn merge_at_root_and_ncdu_accepts_result() {
     let t = tree();
     let out = tempfile::tempdir().unwrap();
-    let f = out.path().join("me.json");
+    let f = out.path().join("me.db");
     export(t.path(), &f);
     fs::remove_dir_all(t.path().join("a")).unwrap();
     assert_eq!(merge(t.path(), &f, &[]).0, 0);
-    let v = parse(&fs::read_to_string(&f).unwrap());
+    let v = db_json(&f);
     assert_eq!(paths(&v), ["top.txt"]);
     assert_eq!(v[3][0]["name"], t.path().to_str().unwrap());
     if Command::new("ncdu").arg("--version").output().is_ok() {
@@ -365,32 +373,21 @@ fn merge_rejects_bad_inputs_and_leaves_file_alone() {
     let t = tree();
     let other = tree();
     let out = tempfile::tempdir().unwrap();
-    let f = out.path().join("me.json");
+    let f = out.path().join("me.db");
     export(t.path(), &f);
     let before = fs::read(&f).unwrap();
 
     // outside the export's root
     assert_eq!(merge(other.path(), &f, &[]).0, 1);
-    // uid mismatch
-    let wrong = (my_uid() + 1).to_string();
-    let (c, e) = merge(&t.path().join("a"), &f, &["-u", &wrong]);
-    assert_eq!(c, 1);
-    assert!(e.contains("export is for uid"), "{e}");
-    // not a dume export
+    // not a database
     let junk = out.path().join("junk.json");
-    fs::write(&junk, "[1,2,{\"progname\":\"ncdu\"},[{\"name\":\"x\"}]]").unwrap();
-    assert_eq!(merge(t.path(), &junk, &[]).0, 1);
     fs::write(&junk, "nope").unwrap();
     assert_eq!(merge(t.path(), &junk, &[]).0, 1);
     // missing export
     assert_eq!(merge(t.path(), &out.path().join("none.json"), &[]).0, 1);
 
     assert_eq!(fs::read(&f).unwrap(), before);
-    assert_eq!(
-        fs::read_dir(out.path()).unwrap().count(),
-        2,
-        "no temp files left"
-    );
+    assert!(!out.path().join(".dume.db.tmp").exists());
 }
 
 #[test]
@@ -398,7 +395,7 @@ fn merge_works_when_stdout_is_a_terminal_free_pipe() {
     // --merge never writes JSON to stdout.
     let t = tree();
     let out = tempfile::tempdir().unwrap();
-    let f = out.path().join("me.json");
+    let f = out.path().join("me.db");
     export(t.path(), &f);
     let (_, stdout, _) = run(&[t.path().to_str().unwrap(), "-m", f.to_str().unwrap()]);
     assert!(stdout.is_empty());
@@ -420,7 +417,7 @@ fn report_tree() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
     fs::write(p.join("other/big.bin"), vec![1u8; 1 << 20]).unwrap();
     fs::hard_link(p.join("other/big.bin"), p.join("other/big2.bin")).unwrap();
     let out = tempfile::tempdir().unwrap();
-    let f = out.path().join("dume.json");
+    let f = out.path().join("dume.db");
     export(p, &f);
     (t, out, f)
 }
@@ -537,4 +534,224 @@ fn wrapper_explains_a_bad_install_on_a_terminal() {
         "{s}"
     );
     assert!(s.contains("EXIT=1"), "{s}");
+}
+
+// ---- database output ----
+
+fn ncdu_or_skip() -> bool {
+    if Command::new("ncdu").arg("--version").output().is_ok() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("DUME_REQUIRE_NCDU").is_none(),
+        "ncdu required but not installed"
+    );
+    eprintln!("ncdu not installed; skipping");
+    false
+}
+
+#[test]
+fn json_from_db_is_accepted_by_ncdu() {
+    if !ncdu_or_skip() {
+        return;
+    }
+    let t = tree();
+    let d = tempfile::tempdir().unwrap();
+    let (f, inp, outp) = (
+        d.path().join("x.db"),
+        d.path().join("a.json"),
+        d.path().join("b.json"),
+    );
+    export(t.path(), &f);
+    fs::write(&inp, run(&["--json", f.to_str().unwrap()]).1).unwrap();
+    let o = Command::new("ncdu")
+        .arg("-f")
+        .arg(&inp)
+        .arg("-o")
+        .arg(&outp)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        paths(&parse(&fs::read_to_string(&outp).unwrap())),
+        paths(&db_json(&f))
+    );
+}
+
+/// Sum of dsize over files, counting each hlnkc inode once, as ncdu does.
+fn total(v: &Value) -> u64 {
+    fn walk(dir: &[Value], seen: &mut std::collections::HashSet<u64>) -> u64 {
+        dir[1..]
+            .iter()
+            .map(|i| match i.as_array() {
+                Some(a) => walk(a, seen),
+                None if i["hlnkc"] == true && !seen.insert(i["ino"].as_u64().unwrap()) => 0,
+                None => i["dsize"].as_u64().unwrap(),
+            })
+            .sum()
+    }
+    walk(v[3].as_array().unwrap(), &mut Default::default())
+}
+
+#[test]
+fn json_from_db_matches_direct_scan_totals() {
+    let t = tree();
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("x.db");
+    export(t.path(), &f);
+    let from_db = db_json(&f);
+    let direct = parse(&run(&[t.path().to_str().unwrap()]).1);
+    assert_eq!(total(&from_db), total(&direct));
+    assert_eq!(paths(&from_db), paths(&direct));
+    assert_eq!(from_db[2]["progname"], "dume");
+    assert_eq!(from_db[2]["uid"], my_uid());
+    assert_eq!(from_db[3][0]["name"], t.path().to_str().unwrap());
+    let hard = from_db[3]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "top.txt")
+        .unwrap();
+    assert_eq!(hard["hlnkc"], true);
+    assert_eq!(hard["nlink"], 2);
+    assert!(hard["mtime"].is_i64());
+}
+
+#[test]
+fn import_json_then_children_match() {
+    use dumelib::db::{Db, import_json};
+    let t = tree();
+    let d = tempfile::tempdir().unwrap();
+    let (j, a, b) = (
+        d.path().join("x.json"),
+        d.path().join("a.db"),
+        d.path().join("b.db"),
+    );
+    fs::write(&j, run(&[t.path().to_str().unwrap()]).1).unwrap();
+    assert_eq!(import_json(&j, &a).unwrap(), 4);
+    export(t.path(), &b);
+    let (da, db) = (Db::open_ro(&a).unwrap(), Db::open_ro(&b).unwrap());
+    assert_eq!(da.meta().unwrap().uid, my_uid());
+    assert_eq!(da.meta().unwrap().root, t.path());
+    for sub in ["", "a", "a/b"] {
+        let p = t.path().join(sub);
+        let key = |db: &Db| -> Vec<_> {
+            db.children(&p)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.name, c.size, c.is_dir))
+                .collect()
+        };
+        assert_eq!(key(&da), key(&db), "{sub}");
+    }
+    assert_eq!(
+        da.total_under(t.path()).unwrap(),
+        db.total_under(t.path()).unwrap()
+    );
+    assert_eq!(fs::metadata(&a).unwrap().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn scan_o_then_merge_then_report() {
+    let (t, _o, f) = report_tree();
+    fs::write(t.path().join("proj/run_0000/new.log"), vec![0u8; 100_000]).unwrap();
+    let (c, _, e) = run(&[
+        t.path().join("proj").to_str().unwrap(),
+        "-m",
+        f.to_str().unwrap(),
+    ]);
+    assert_eq!(c, 0, "{e}");
+    let (c, out, e) = report(t.path(), &f, &[]);
+    assert_eq!(c, 0, "{e}");
+    assert_eq!(row(&out, "*.log")[1], "6", "{out}");
+    assert!(
+        run(&[t.path().to_str().unwrap(), "-o", f.to_str().unwrap()])
+            .2
+            .contains("files for uid")
+    );
+}
+
+#[test]
+fn stdout_mode_unchanged_and_terminal_refused() {
+    let t = tree();
+    let (c, out, _) = run(&[t.path().to_str().unwrap()]);
+    assert_eq!(c, 0);
+    assert_eq!(parse(&out)[2]["progname"], "dume");
+    assert_eq!(run(&[]).0, 2, "DIR is required without --json");
+    assert_eq!(run(&["-m", "x.db"]).0, 2);
+    let Ok(sh) = Command::new("script").arg("--version").output() else {
+        return;
+    };
+    if !sh.status.success() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("x.db");
+    export(t.path(), &f);
+    let cmd = format!("{} --json {}", env!("CARGO_BIN_EXE_dume-scan"), f.display());
+    let o = Command::new("script")
+        .args(["-qec", &format!("{cmd}; echo EXIT=$?"), "/dev/null"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(s.contains("refusing to write JSON to a terminal"), "{s}");
+    assert!(s.contains("EXIT=2"), "{s}");
+}
+
+#[test]
+fn empty_database_gives_empty_json_and_report() {
+    let t = tempfile::tempdir().unwrap();
+    fs::create_dir(t.path().join("sub")).unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("x.db");
+    export(t.path(), &f);
+    let v = db_json(&f);
+    assert_eq!(v[3].as_array().unwrap().len(), 1);
+    assert_eq!(v[3][0]["name"], t.path().to_str().unwrap());
+    if ncdu_or_skip() {
+        let j = d.path().join("e.json");
+        fs::write(&j, run(&["--json", f.to_str().unwrap()]).1).unwrap();
+        let o = Command::new("ncdu")
+            .arg("-f")
+            .arg(&j)
+            .args(["-o", "/dev/null"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let (c, _, e) = report(t.path(), &f, &[]);
+    assert_eq!(c, 0, "{e}");
+    // a missing non-root path is still an error
+    assert_eq!(report(&t.path().join("sub"), &f, &[]).0, 1);
+
+    // importing an empty export reads back the same way
+    let j = d.path().join("old.json");
+    fs::write(&j, run(&[t.path().to_str().unwrap()]).1).unwrap();
+    let g = d.path().join("y.db");
+    assert_eq!(dumelib::db::import_json(&j, &g).unwrap(), 0);
+    assert_eq!(db_json(&g)[3].as_array().unwrap().len(), 1);
+    assert_eq!(report(t.path(), &g, &[]).0, 0);
+}
+
+#[test]
+fn import_rejects_missing_names_and_uid_conflicts() {
+    let d = tempfile::tempdir().unwrap();
+    let j = d.path().join("bad.json");
+    fs::write(
+        &j,
+        r#"[1,2,{"progname":"dume","uid":1},[{"name":"/r"},{"asize":1,"dsize":1,"ino":1}]]"#,
+    )
+    .unwrap();
+    let e = dumelib::db::import_json(&j, &d.path().join("x.db")).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(e.to_string().contains("name"), "{e}");
+    let f = d.path().join("x.db");
+    for flag in ["-m", "-r", "--json"] {
+        let mut a = vec!["/tmp", "-u", "1", flag, f.to_str().unwrap()];
+        if flag == "--json" {
+            a.remove(0);
+        }
+        assert_eq!(run(&a).0, 2, "{flag}");
+    }
 }

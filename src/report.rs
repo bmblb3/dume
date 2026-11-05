@@ -4,9 +4,11 @@
 //! `run_0042` and `run_0043` fall into one group. Dir groups count only the outermost match
 //! of each pattern; different patterns may overlap, so their percentages need not add up.
 
+use crate::db::{Db, Ev};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::path::Path;
 
 /// Patterns seen fewer times than this are just names, not patterns.
 const MIN_COUNT: u64 = 3;
@@ -199,6 +201,27 @@ fn rows(groups: HashMap<String, Group>) -> Vec<Row> {
         .collect();
     rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.pattern.cmp(&b.pattern)));
     rows
+}
+
+/// [`analyse`] for the directory `here` in a database. Loads that whole subtree
+/// into memory as an ncdu-shaped value, so the pattern logic stays shared.
+pub fn analyse_db(db: &Db, here: &Path, keep_paths: bool) -> io::Result<Report> {
+    let name = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let mut stack = vec![vec![serde_json::json!({ "name": here.to_string_lossy() })]];
+    db.walk(here, &mut |ev| {
+        match ev {
+            Ev::Open(n) => stack.push(vec![serde_json::json!({ "name": name(n) })]),
+            Ev::File(r) => stack.last_mut().unwrap().push(serde_json::json!({
+                "name": name(&r.name), "dsize": r.dsize, "ino": r.ino, "hlnkc": r.nlink > 1
+            })),
+            Ev::Close => {
+                let d = stack.pop().unwrap();
+                stack.last_mut().unwrap().push(Value::Array(d));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(analyse(&stack.pop().unwrap(), keep_paths))
 }
 
 /// Analyse an export directory array. `keep_paths` also records every matching directory.

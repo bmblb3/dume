@@ -35,13 +35,21 @@ pub fn push_name(out: &mut Vec<u8>, name: &[u8]) {
     push_str(out, &String::from_utf8_lossy(name));
 }
 
-/// Append `,{...}` describing one regular file.
-pub fn push_file(out: &mut Vec<u8>, name: &[u8], asize: u64, dsize: u64, ino: u64, nlink: u64) {
+/// Append `,{...}` describing one regular file (`mtime` only when known).
+pub fn push_file(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    (asize, dsize, ino, nlink): (u64, u64, u64, u64),
+    mtime: Option<i64>,
+) {
     out.extend_from_slice(b",{\"name\":");
     push_name(out, name);
     let _ = write!(out, ",\"asize\":{asize},\"dsize\":{dsize},\"ino\":{ino}");
     if nlink > 1 {
         let _ = write!(out, ",\"hlnkc\":true,\"nlink\":{nlink}");
+    }
+    if let Some(m) = mtime {
+        let _ = write!(out, ",\"mtime\":{m}");
     }
     out.push(b'}');
 }
@@ -75,11 +83,11 @@ mod tests {
     #[test]
     fn file_entry() {
         let mut v = Vec::new();
-        push_file(&mut v, b"f", 10, 4096, 7, 1);
-        push_file(&mut v, b"g", 0, 0, 8, 3);
+        push_file(&mut v, b"f", (10, 4096, 7, 1), None);
+        push_file(&mut v, b"g", (0, 0, 8, 3), Some(5));
         assert_eq!(
             String::from_utf8(v).unwrap(),
-            r#",{"name":"f","asize":10,"dsize":4096,"ino":7},{"name":"g","asize":0,"dsize":0,"ino":8,"hlnkc":true,"nlink":3}"#
+            r#",{"name":"f","asize":10,"dsize":4096,"ino":7},{"name":"g","asize":0,"dsize":0,"ino":8,"hlnkc":true,"nlink":3,"mtime":5}"#
         );
     }
 }

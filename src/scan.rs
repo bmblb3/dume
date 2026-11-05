@@ -19,11 +19,32 @@ use std::sync::{Arc, Mutex};
 const PAR_THRESHOLD: usize = 512;
 const CHUNK: usize = 256;
 
+/// One kept regular file. Names are raw bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRec {
+    pub name: Vec<u8>,
+    pub asize: u64,
+    pub dsize: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub mtime: i64,
+}
+
+/// A directory with the files kept in it, as seen by [`Scan::for_each_dir`].
+pub struct DirView<'a> {
+    pub id: usize,
+    pub parent: Option<usize>,
+    pub name: &'a [u8],
+    pub files: &'a [FileRec],
+}
+
 #[derive(Default)]
 struct Node {
     name: Vec<u8>,
     /// Pre-serialised `,{file}` entries.
     files: Vec<u8>,
+    /// Structured copies of the kept files (only when scanning with `records`).
+    recs: Vec<FileRec>,
     /// Indices of child directories (always greater than this node's index).
     subs: Vec<usize>,
 }
@@ -42,6 +63,7 @@ struct Ctx {
     arena: Mutex<Vec<Node>>,
     stats: Arc<Progress>,
     verbose_errors: bool,
+    records: bool,
 }
 
 impl Ctx {
@@ -67,7 +89,7 @@ pub fn scan(
     threads: usize,
     verbose_errors: bool,
 ) -> io::Result<(Scan, u64)> {
-    scan_progress(root, uid, threads, verbose_errors, Arc::default())
+    scan_progress(root, uid, threads, verbose_errors, Arc::default(), false)
 }
 
 /// Like [`scan`], publishing counters to `progress` as it goes.
@@ -77,6 +99,7 @@ pub fn scan_progress(
     threads: usize,
     verbose_errors: bool,
     progress: Arc<Progress>,
+    records: bool,
 ) -> io::Result<(Scan, u64)> {
     let rootfd = open_dir(rustix::fs::CWD, root)?;
     let st = statat(&rootfd, ".", AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
@@ -87,6 +110,7 @@ pub fn scan_progress(
         arena: Mutex::new(vec![Node::default()]),
         stats: progress,
         verbose_errors,
+        records,
     };
     drop(rootfd);
 
@@ -129,6 +153,7 @@ fn open_dir(dirfd: BorrowedFd<'_>, path: &Path) -> io::Result<rustix::fd::OwnedF
 /// Result of listing one directory and stat'ing its entries.
 struct Listing {
     files: Vec<u8>,
+    recs: Vec<FileRec>,
     count: u64,
     subdirs: Vec<Vec<u8>>,
 }
@@ -165,12 +190,14 @@ fn read_dir(ctx: &Ctx, path: &Path) -> io::Result<Listing> {
     let fdref = fd.as_fd();
     let merge = |mut a: Listing, b: Listing| {
         a.files.extend_from_slice(&b.files);
+        a.recs.extend(b.recs);
         a.count += b.count;
         a.subdirs.extend(b.subdirs);
         a
     };
     let empty = || Listing {
         files: Vec::new(),
+        recs: Vec::new(),
         count: 0,
         subdirs: Vec::new(),
     };
@@ -193,6 +220,7 @@ fn stat_chunk(
 ) -> Listing {
     let mut l = Listing {
         files: Vec::new(),
+        recs: Vec::new(),
         count: 0,
         subdirs: Vec::new(),
     };
@@ -219,11 +247,24 @@ fn stat_chunk(
                 json::push_file(
                     &mut l.files,
                     name,
-                    st.st_size as u64,
-                    (st.st_blocks as u64) * 512,
-                    st.st_ino as u64,
-                    st.st_nlink as u64,
+                    (
+                        st.st_size as u64,
+                        (st.st_blocks as u64) * 512,
+                        st.st_ino as u64,
+                        st.st_nlink as u64,
+                    ),
+                    None,
                 );
+                if ctx.records {
+                    l.recs.push(FileRec {
+                        name: name.clone(),
+                        asize: st.st_size as u64,
+                        dsize: (st.st_blocks as u64) * 512,
+                        ino: st.st_ino as u64,
+                        nlink: st.st_nlink as u64,
+                        mtime: st.st_mtime as i64,
+                    });
+                }
                 l.count += 1;
             }
             // Stay on one filesystem: skips mounts (NFS, autofs triggers, bind mounts).
@@ -240,6 +281,7 @@ fn finish<'s>(ctx: &'s Ctx, idx: usize, path: &Path, l: Listing, scope: &rayon::
     let ids: Vec<usize> = {
         let mut arena = ctx.arena.lock().unwrap();
         arena[idx].files = l.files;
+        arena[idx].recs = l.recs;
         let first = arena.len();
         arena.extend(l.subdirs.iter().map(|n| Node {
             name: n.clone(),
@@ -259,6 +301,24 @@ fn finish<'s>(ctx: &'s Ctx, idx: usize, path: &Path, l: Listing, scope: &rayon::
 }
 
 impl Scan {
+    /// Visit every directory, parents before children. Empty without `records`.
+    pub fn for_each_dir(&self, mut f: impl FnMut(DirView)) {
+        let mut parent = vec![None; self.nodes.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            for &c in &n.subs {
+                parent[c] = Some(i);
+            }
+        }
+        for (id, n) in self.nodes.iter().enumerate() {
+            f(DirView {
+                id,
+                parent: parent[id],
+                name: &n.name,
+                files: &n.recs,
+            });
+        }
+    }
+
     /// Write the ncdu export document. Directories with no kept files are pruned.
     pub fn write(
         &self,
@@ -339,4 +399,54 @@ fn open_dir_entry(buf: &mut Vec<u8>, name: &[u8], dev: Option<u64>) {
         let _ = write!(buf, ",\"dev\":{d}");
     }
     buf.push(b'}');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn make(dir: &Path) -> Vec<u8> {
+        let name = b"bad\xff.txt".to_vec();
+        let mut f = std::fs::File::create(dir.join(OsStr::from_bytes(&name))).unwrap();
+        f.write_all(b"hello").unwrap();
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        name
+    }
+
+    fn uid() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[test]
+    fn records_carry_mtime_and_names() {
+        let t = tempfile::tempdir().unwrap();
+        let name = make(t.path());
+        let (s, _) = scan_progress(t.path(), uid(), 2, false, Arc::default(), true).unwrap();
+        let mut seen = Vec::new();
+        s.for_each_dir(|d| seen.push((d.id, d.parent, d.files.to_vec())));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, None);
+        assert_eq!(seen[0].2.len(), 1);
+        assert_eq!(seen[0].2[0].name, name);
+        assert_eq!(seen[0].2[0].mtime, 1_000_000);
+        assert_eq!(seen[0].2[0].asize, 5);
+    }
+
+    #[test]
+    fn records_false_keeps_json_output_identical() {
+        let t = tempfile::tempdir().unwrap();
+        make(t.path());
+        std::fs::create_dir(t.path().join("sub")).unwrap();
+        std::fs::write(t.path().join("sub/a"), b"x").unwrap();
+        let json = |records| {
+            let (s, dev) =
+                scan_progress(t.path(), uid(), 2, false, Arc::default(), records).unwrap();
+            let mut out = Vec::new();
+            s.write_tree(&mut out, "r", Some(dev)).unwrap();
+            out
+        };
+        assert_eq!(json(true), json(false));
+    }
 }
