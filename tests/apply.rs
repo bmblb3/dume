@@ -1,4 +1,4 @@
-use dumelib::apply::{Verdict, run};
+use dumelib::apply::{Verdict, check, delete, run};
 use dumelib::recipe::{Apply, Hit, Recipe};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -314,4 +314,102 @@ fn cancel_stops_after_current_path() {
     assert_eq!(calls, 3);
     assert!(!here.join("a").exists());
     assert!(here.join("b").exists() && here.join("c").exists());
+}
+
+/// The guard passes, then a parent is swapped for a symlink to an outside directory before
+/// the delete: the delete must act on the directory that was checked, never through the link.
+#[test]
+fn parent_swapped_for_symlink_after_guard_does_not_delete_outside() {
+    let (t, root, here) = tree();
+    let outside = t.path().join("outside");
+    put(&outside.join("x"));
+    put(&outside.join("d/y"));
+    put(&here.join("p/x"));
+    put(&here.join("p/d/y"));
+    let fx = check(&root, &here, &hit(&root, "h/p/x")).unwrap();
+    let dd = check(&root, &here, &hit(&root, "h/p/d")).unwrap();
+    fs::rename(here.join("p"), here.join("p.old")).unwrap();
+    symlink(&outside, here.join("p")).unwrap();
+    assert_eq!(delete(&fx, &|_, d| d), Verdict::Done);
+    assert_eq!(delete(&dd, &|_, d| d), Verdict::Done);
+    assert!(
+        outside.join("x").exists(),
+        "deleted through a swapped parent"
+    );
+    assert!(
+        outside.join("d/y").exists(),
+        "deleted through a swapped parent"
+    );
+    // What was checked is what got deleted.
+    assert!(!here.join("p.old/x").exists());
+    assert!(!here.join("p.old/d").exists());
+}
+
+/// Tests can't mount, so the device of each entry is overridden: `mnt` pretends to be
+/// another filesystem. It must be neither entered nor removed, and the rest still goes.
+#[test]
+fn mount_point_or_other_device_is_not_crossed() {
+    let (_t, root, here) = tree();
+    put(&here.join("d/a/f"));
+    put(&here.join("d/mnt/inside"));
+    put(&here.join("d/g"));
+    let c = check(&root, &here, &hit(&root, "h/d")).unwrap();
+    let v = delete(&c, &|name, dev| if name == "mnt" { dev + 1 } else { dev });
+    assert_eq!(v, Verdict::Failed("contains a mount point: mnt".into()));
+    assert!(
+        here.join("d/mnt/inside").exists(),
+        "crossed into another device"
+    );
+    assert!(!here.join("d/a").exists() && !here.join("d/g").exists());
+}
+
+#[test]
+fn prefix_sibling_is_not_touched() {
+    let (_t, root, here) = tree();
+    put(&here.join("case1/f"));
+    put(&here.join("case10/f"));
+    put(&root.join("h0/f"));
+    let hits = [hit(&root, "h/case1"), raw(b"h0/f", false)];
+    let v = go(&recipe(Apply::Delete), &root, &here, &hits, None);
+    assert_eq!(v[0], Verdict::Done);
+    assert!(matches!(v[1], Verdict::Skipped(_)), "{v:?}");
+    assert!(!here.join("case1").exists());
+    assert!(here.join("case10/f").exists() && root.join("h0/f").exists());
+}
+
+#[test]
+fn non_utf8_name_is_deleted() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let (_t, root, here) = tree();
+    put(&here.join(OsStr::from_bytes(b"caf\xe9")));
+    put(&here.join(OsStr::from_bytes(b"d\xff/f")));
+    let mut f = hit(&root, "h");
+    f.path = b"h/caf\xe9".to_vec();
+    f.is_dir = false;
+    f.mtime = None;
+    let hits = [f, raw(b"h/d\xff", true)];
+    let v = go(&recipe(Apply::Delete), &root, &here, &hits, None);
+    assert_eq!(v, [Verdict::Done, Verdict::Done]);
+    assert_eq!(fs::read_dir(&here).unwrap().count(), 0);
+}
+
+#[test]
+fn double_slash_in_hit_path_is_normalised_or_refused() {
+    let (_t, root, here) = tree();
+    put(&here.join("f"));
+    put(&here.join("g"));
+    put(&root.join("x"));
+    let hits = [
+        raw(b"h//f", false),
+        raw(b"h/./g", false),
+        raw(b"h//../x", false),
+    ];
+    let v = go(&recipe(Apply::Delete), &root, &here, &hits, None);
+    // `Path` normalises `//` and an inner `.`, so these name the real files below `here`.
+    assert_eq!(v[0], Verdict::Done);
+    assert_eq!(v[1], Verdict::Done);
+    assert!(matches!(v[2], Verdict::Skipped(_)), "{v:?}");
+    assert!(!here.join("f").exists() && !here.join("g").exists());
+    assert!(root.join("x").exists());
 }
