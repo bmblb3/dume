@@ -1,7 +1,7 @@
 use dumelib::db::{Db, scan_to_db};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 fn uid() -> u32 {
@@ -84,4 +84,24 @@ fn db_file_is_0600_and_uses_rollback_journal() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
     assert_eq!(j, "delete");
+}
+
+#[test]
+fn hardlinks_are_counted_once_in_tree_size() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("r");
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    write(&root.join("a/f"), 8000);
+    std::fs::hard_link(root.join("a/f"), root.join("b/g")).unwrap();
+    let dbp = t.path().join("x.db");
+    assert_eq!(
+        scan_to_db(&root, &dbp, uid(), 1, Default::default()).unwrap(),
+        2
+    );
+    let db = Db::open_ro(&dbp).unwrap();
+    let one = std::fs::metadata(root.join("a/f")).unwrap().blocks() * 512;
+    assert_eq!(db.total_under(&root).unwrap(), one);
+    assert_eq!(db.children(&root.join("a")).unwrap().len(), 1);
+    assert_eq!(db.children(&root.join("b")).unwrap().len(), 1);
 }

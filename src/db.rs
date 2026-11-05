@@ -176,10 +176,22 @@ fn build(
     // Directory ids ascend parent-before-child, so a reverse pass sums children first.
     let mut dirs = Vec::new();
     scan.for_each_dir(|d| dirs.push((d.parent, d.name.to_vec(), d.files.to_vec())));
-    let mut tree: Vec<u64> = dirs
+    // Later hardlinks to an inode already seen contribute 0 (matches report/JSON).
+    let mut seen = std::collections::HashSet::new();
+    let counted: Vec<Vec<u64>> = dirs
         .iter()
-        .map(|d| d.2.iter().map(|f| f.dsize).sum())
+        .map(|d| {
+            let counted = |f: &crate::scan::FileRec| {
+                if f.nlink > 1 && !seen.insert(f.ino) {
+                    0
+                } else {
+                    f.dsize
+                }
+            };
+            d.2.iter().map(counted).collect()
+        })
         .collect();
+    let mut tree: Vec<u64> = counted.iter().map(|c| c.iter().sum()).collect();
     let mut keep: Vec<bool> = dirs.iter().map(|d| !d.2.is_empty()).collect();
     for i in (0..dirs.len()).rev() {
         if let Some(p) = dirs[i].0 {
@@ -219,7 +231,7 @@ fn build(
                 tree[i] as i64
             ])
             .map_err(err)?;
-            for f in &d.2 {
+            for (f, &cnt) in d.2.iter().zip(&counted[i]) {
                 let p = if paths[i].is_empty() {
                     f.name.clone()
                 } else {
@@ -235,7 +247,7 @@ fn build(
                     f.ino as i64,
                     f.nlink as i64,
                     f.mtime,
-                    f.dsize as i64
+                    cnt as i64
                 ])
                 .map_err(err)?;
             }
@@ -256,5 +268,6 @@ fn build(
     }
     tx.commit().map_err(err)?;
     conn.close().map_err(|(_, e)| err(e))?;
+    std::fs::File::open(tmp)?.sync_all()?;
     Ok(scan.files)
 }
