@@ -5,20 +5,23 @@
 //! raw bytes relative to the scan root with no leading `/`; the root directory has
 //! the empty path and a NULL parent. Directories with no kept files are not stored.
 //! A directory's `tree_size` is the sum of `dsize` of the files beneath it; a
-//! file's `tree_size` equals its `dsize`. Hardlinks are stored as scanned (the
-//! scanner does not flag repeats), so `dsize` is not de-duplicated per inode.
+//! file's `tree_size` equals its `dsize`, except that a hardlinked inode (nlink>1)
+//! counts once in the whole db: later links keep their `dsize` but have `tree_size` 0.
 //! `meta(key TEXT PRIMARY KEY, value)` holds root, dev, uid, scanned (unix secs),
 //! progver.
 //!
 //! A partial index on `ino` (nlink>1 rows) serves hardlink lookups in `refresh`.
+//! `import_json` builds the same schema from an old `dume.json` (mtime NULL).
 //!
 //! A scan is built in a sibling `.dume.db.tmp` in one transaction, then renamed
 //! over the target, so readers see either the old or the new database.
 
-use crate::scan::{FileRec, Progress, Scan, scan_progress};
+use crate::json;
+use crate::merge;
+use crate::scan::{DirView, FileRec, Progress, Scan, scan_progress};
 use rusqlite::{Connection, OpenFlags, params};
 use rustix::fs::{FlockOperation, flock};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -132,19 +135,13 @@ impl Db {
     }
 }
 
-/// Scan `root` for `uid`'s files into the database at `db`, replacing it
-/// atomically. Returns the number of files kept.
-pub fn scan_to_db(
-    root: &Path,
-    db: &Path,
-    uid: u32,
-    threads: usize,
-    progress: Arc<Progress>,
-) -> io::Result<u64> {
+/// Build a database with `make(tmp)` beside `db` and rename it into place; the
+/// previous database survives any failure. Takes the writer lock.
+fn atomic(db: &Path, make: impl FnOnce(&Path) -> io::Result<u64>) -> io::Result<u64> {
     let _lock = lock_writer(db)?;
     let tmp = db.with_file_name(".dume.db.tmp");
     let _ = std::fs::remove_file(&tmp);
-    let r = build(root, &tmp, uid, threads, progress).and_then(|n| {
+    let r = make(&tmp).and_then(|n| {
         std::fs::rename(&tmp, db)?;
         Ok(n)
     });
@@ -154,14 +151,208 @@ pub fn scan_to_db(
     r
 }
 
-fn build(
+/// A file row as read back from the database.
+pub struct DbFile {
+    pub name: Vec<u8>,
+    pub asize: u64,
+    pub dsize: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub mtime: Option<i64>,
+}
+
+/// Events of a depth-first walk; every `Open` is matched by a `Close`.
+pub enum Ev<'a> {
+    Open(&'a [u8]),
+    File(&'a DbFile),
+    Close,
+}
+
+impl Db {
+    /// Walk everything under the stored directory `here`, files before
+    /// subdirectories, each sorted by name. Holds one directory's rows at a time.
+    pub fn walk(&self, here: &Path, f: &mut dyn FnMut(Ev) -> io::Result<()>) -> io::Result<()> {
+        let rel = self.rel(here)?;
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM entries WHERE path=? AND is_dir=1",
+                [&rel],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !found {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not in the database", here.display()),
+            ));
+        }
+        self.walk_dir(&rel, f)
+    }
+
+    fn walk_dir(&self, rel: &[u8], f: &mut dyn FnMut(Ev) -> io::Result<()>) -> io::Result<()> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT name, is_dir, asize, dsize, ino, nlink, mtime FROM entries WHERE parent=? ORDER BY is_dir, name")
+            .map_err(err)?;
+        let rows: Vec<(bool, DbFile)> = st
+            .query_map([rel], |r| {
+                Ok((
+                    r.get(1)?,
+                    DbFile {
+                        name: r.get(0)?,
+                        asize: r.get::<_, i64>(2)? as u64,
+                        dsize: r.get::<_, i64>(3)? as u64,
+                        ino: r.get::<_, i64>(4)? as u64,
+                        nlink: r.get::<_, i64>(5)? as u64,
+                        mtime: r.get(6)?,
+                    },
+                ))
+            })
+            .map_err(err)?
+            .collect::<Result<_, _>>()
+            .map_err(err)?;
+        drop(st);
+        for (is_dir, r) in &rows {
+            if *is_dir {
+                f(Ev::Open(&r.name))?;
+                self.walk_dir(&join(rel, &r.name), f)?;
+                f(Ev::Close)?;
+            } else {
+                f(Ev::File(r))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream the whole database as an ncdu export, matching the scanner's output
+    /// (every nlink>1 file carries `hlnkc`, so ncdu counts each inode once).
+    pub fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
+        let m = self.meta()?;
+        let mut buf = Vec::with_capacity(1 << 20);
+        buf.extend_from_slice(b"[1,2,{\"progname\":\"dume\",\"progver\":");
+        json::push_str(&mut buf, &m.progver);
+        let _ = write!(
+            buf,
+            ",\"uid\":{},\"timestamp\":{}}},[{{\"name\":",
+            m.uid, m.scanned
+        );
+        json::push_name(&mut buf, m.root.as_os_str().as_bytes());
+        let _ = write!(buf, ",\"dev\":{}}}", m.dev);
+        self.walk(&m.root, &mut |ev| {
+            match ev {
+                Ev::Open(n) => {
+                    buf.extend_from_slice(b",[{\"name\":");
+                    json::push_name(&mut buf, n);
+                    buf.extend_from_slice(b"}");
+                }
+                Ev::File(r) => json::push_file(
+                    &mut buf,
+                    &r.name,
+                    (r.asize, r.dsize, r.ino, r.nlink),
+                    r.mtime,
+                ),
+                Ev::Close => buf.push(b']'),
+            }
+            if buf.len() >= 1 << 20 {
+                out.write_all(&buf)?;
+                buf.clear();
+            }
+            Ok(())
+        })?;
+        buf.extend_from_slice(b"]]\n");
+        out.write_all(&buf)?;
+        out.flush()
+    }
+}
+
+/// Scan `root` for `uid`'s files into the database at `db`, replacing it
+/// atomically. Returns the number of files kept.
+pub fn scan_to_db(
     root: &Path,
-    tmp: &Path,
+    db: &Path,
     uid: u32,
     threads: usize,
     progress: Arc<Progress>,
 ) -> io::Result<u64> {
-    let (scan, dev) = scan_progress(root, uid, threads, false, progress, true)?;
+    atomic(db, |tmp| {
+        let (scan, dev) = scan_progress(root, uid, threads, false, progress, true)?;
+        let p = plan(|f| scan.for_each_dir(f), b"", &|_| false);
+        write_db(tmp, &p, root, dev, uid)?;
+        Ok(scan.files)
+    })
+}
+
+/// Convert an old `dume.json` export into a database at `db` (mtime NULL).
+/// Returns the number of files.
+pub fn import_json(json: &Path, db: &Path) -> io::Result<u64> {
+    let ex = merge::Export::load(json)?;
+    let uid = ex.uid()?;
+    // (parent index, name, files), parents before children.
+    let mut dirs: Vec<(Option<usize>, Vec<u8>, Vec<FileRec>)> = Vec::new();
+    let mut files = 0;
+    let mut stack = vec![(None, ex.subtree(&[])?)];
+    while let Some((parent, d)) = stack.pop() {
+        let id = dirs.len();
+        let name = d[0]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
+        let mut recs = Vec::new();
+        for item in &d[1..] {
+            if item.is_array() {
+                continue;
+            }
+            let n = |k| item[k].as_u64().unwrap_or(0);
+            recs.push(FileRec {
+                name: item["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec(),
+                asize: n("asize"),
+                dsize: n("dsize"),
+                ino: n("ino"),
+                nlink: item["nlink"].as_u64().unwrap_or(1),
+                mtime: 0,
+            });
+        }
+        files += recs.len() as u64;
+        dirs.push((parent, name, recs));
+        // Reverse so children pop in document order (any order is valid).
+        for c in d[1..].iter().rev().filter_map(|v| v.as_array()) {
+            stack.push((Some(id), c.as_slice()));
+        }
+    }
+    atomic(db, |tmp| {
+        let mut p = plan(
+            |f| {
+                for (id, (parent, name, files)) in dirs.iter().enumerate() {
+                    f(DirView {
+                        id,
+                        parent: *parent,
+                        name,
+                        files,
+                    });
+                }
+            },
+            b"",
+            &|_| false,
+        );
+        p.null_mtime = true;
+        write_db(
+            tmp,
+            &p,
+            Path::new(&ex.root_name()),
+            ex.dev().unwrap_or(0),
+            uid,
+        )?;
+        Ok(files)
+    })
+}
+
+fn write_db(tmp: &Path, plan: &Plan, root: &Path, dev: u64, uid: u32) -> io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -176,8 +367,6 @@ fn build(
          CREATE TABLE meta(key TEXT PRIMARY KEY, value);",
     )
     .map_err(err)?;
-
-    let plan = plan(&scan, b"", &|_| false);
 
     let tx = conn.transaction().map_err(err)?;
     {
@@ -198,8 +387,7 @@ fn build(
     }
     tx.commit().map_err(err)?;
     conn.close().map_err(|(_, e)| err(e))?;
-    std::fs::File::open(tmp)?.sync_all()?;
-    Ok(scan.files)
+    std::fs::File::open(tmp)?.sync_all()
 }
 
 /// Held while this process is the single writer of a scan database.
@@ -235,6 +423,8 @@ struct Plan {
     dirs: Vec<PDir>,
     tree: Vec<u64>,
     keep: Vec<bool>,
+    /// Store mtime as NULL (rows imported from JSON have none).
+    null_mtime: bool,
 }
 
 struct PDir {
@@ -255,13 +445,17 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
 }
 
 /// `held(ino)`: the inode already counts elsewhere, so repeats here contribute 0.
-fn plan(scan: &Scan, base: &[u8], held: &dyn Fn(u64) -> bool) -> Plan {
+fn plan(
+    each_dir: impl FnOnce(&mut dyn FnMut(DirView)),
+    base: &[u8],
+    held: &dyn Fn(u64) -> bool,
+) -> Plan {
     // Directory ids ascend parent-before-child, so a reverse pass sums children first.
     let mut up = Vec::new();
     let mut dirs: Vec<PDir> = Vec::new();
     // Later hardlinks to an inode already seen contribute 0 (matches report/JSON).
     let mut seen = std::collections::HashSet::new();
-    scan.for_each_dir(|d| {
+    each_dir(&mut |d| {
         let counted = d
             .files
             .iter()
@@ -302,7 +496,12 @@ fn plan(scan: &Scan, base: &[u8], held: &dyn Fn(u64) -> bool) -> Plan {
             keep[p] |= keep[i];
         }
     }
-    Plan { dirs, tree, keep }
+    Plan {
+        dirs,
+        tree,
+        keep,
+        null_mtime: false,
+    }
 }
 
 /// (parent path, name) of a non-empty relative path.
@@ -356,7 +555,7 @@ impl Plan {
                     f.dsize as i64,
                     f.ino as i64,
                     f.nlink as i64,
-                    f.mtime,
+                    (!self.null_mtime).then_some(f.mtime),
                     cnt as i64
                 ])
                 .map_err(err)?;
@@ -484,7 +683,7 @@ fn replace(tx: &Connection, rel: &[u8], scan: Option<&Scan>) -> io::Result<()> {
             )
             .is_ok()
         };
-        let p = plan(scan, rel, &held);
+        let p = plan(|f| scan.for_each_dir(f), rel, &held);
         if p.keep[0] {
             for a in ancestors(rel) {
                 let (par, name) = if a.is_empty() {

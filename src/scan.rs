@@ -247,10 +247,13 @@ fn stat_chunk(
                 json::push_file(
                     &mut l.files,
                     name,
-                    st.st_size as u64,
-                    (st.st_blocks as u64) * 512,
-                    st.st_ino as u64,
-                    st.st_nlink as u64,
+                    (
+                        st.st_size as u64,
+                        (st.st_blocks as u64) * 512,
+                        st.st_ino as u64,
+                        st.st_nlink as u64,
+                    ),
+                    None,
                 );
                 if ctx.records {
                     l.recs.push(FileRec {
