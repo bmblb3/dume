@@ -530,11 +530,13 @@ fn confirm_names_directory_count_and_total_and_warns_at_scan_root() {
     );
     assert!(s.contains("Time steps"), "{s}");
     assert!(
-        s.contains(&format!("6 paths ({})", human(6 * (64 << 10)))),
+        s.contains(&format!(
+            "Remove 6 paths ({})? This cannot be undone.",
+            human(6 * (64 << 10))
+        )),
         "{s}"
     );
-    assert!(s.contains("This cannot be undone."), "{s}");
-    assert!(!s.contains("WHOLE scan root"), "{s}");
+    assert!(!s.contains("whole scan"), "{s}");
     key(&mut a, KeyCode::Char('n'));
     assert_eq!(a.mode, Mode::Paths);
     assert!(big_paths(&e).iter().all(|p| p.exists()));
@@ -544,7 +546,13 @@ fn confirm_names_directory_count_and_total_and_warns_at_scan_root() {
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Enter);
     let s = screen(&mut a);
-    assert!(s.contains("WHOLE scan root"), "{s}");
+    assert!(
+        s.contains(
+            "This is the top folder of the whole scan: everything ticked below it will be changed."
+        ),
+        "{s}"
+    );
+    assert!(!s.contains("scan root"), "no jargon: {s}");
     key(&mut a, KeyCode::Esc);
     assert_eq!(a.mode, Mode::Paths);
 }
@@ -617,8 +625,10 @@ fn script_recipe_runs_per_ticked_file() {
     key(&mut a, KeyCode::Char(' ')); // untick case_1/200/big
     key(&mut a, KeyCode::Enter);
     let s = screen(&mut a);
-    assert!(s.contains("Runs touch.sh on each file"), "{s}");
-    assert!(!s.contains("cannot be undone"), "{s}");
+    assert!(
+        s.contains("Run touch.sh on 5 files? This cannot be undone."),
+        "{s}"
+    );
     key(&mut a, KeyCode::Char('y'));
     let s = settle(&mut a);
     assert_eq!(a.mode, Mode::Done, "{s}");
@@ -776,4 +786,110 @@ fn huge_selection_draws_only_visible_paths() {
     key(&mut a, KeyCode::End);
     let s = screen(&mut a);
     assert!(s.contains("f_019999") && !s.contains("f_000000"), "{s}");
+}
+
+/// A recipe that counts to `n` in SQL and then returns nothing, so it takes a while.
+fn slow(n: u64) -> String {
+    format!(
+        "-- dume-name: Zz slow\nWITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < {n}) \
+         SELECT CAST('none' AS BLOB) AS path FROM n WHERE i < 0"
+    )
+}
+
+#[test]
+fn cannot_start_a_clean_while_recipes_are_still_being_checked() {
+    let e = env();
+    let sl = slow(3_000_000);
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG, ("slow.sql", &sl)]));
+    key(&mut a, KeyCode::Char('c'));
+    // Wait for the first recipe while the slow one is still running.
+    let t = Instant::now();
+    while !(a.mode == Mode::Menu && screen(&mut a).contains("Time steps")) {
+        assert!(t.elapsed() < Duration::from_secs(20), "no menu");
+        a.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(a.busy(), "the slow recipe finished too soon for this test");
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Menu, "no choosing while recipes are checked");
+    let s = screen(&mut a);
+    assert!(s.contains("Still checking recipes — one moment…"), "{s}");
+    settle(&mut a);
+    assert_eq!(a.mode, Mode::Menu);
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Paths);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(
+        s.contains(&format!("Freed {}", human(6 * (64 << 10)))),
+        "{s}"
+    );
+    assert!(big_paths(&e).iter().all(|p| !p.exists()));
+    let d = Db::open_ro(&e.db).unwrap();
+    assert!(
+        d.children(&e.root.join("proj/case_1/100"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn failed_rescan_after_clean_says_it_could_not_measure() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    let lock = db::lock_writer(&e.db).unwrap();
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    drop(lock);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(
+        big_paths(&e).iter().all(|p| !p.exists()),
+        "files were removed"
+    );
+    assert!(
+        s.contains("dume could not measure how much space was freed."),
+        "{s}"
+    );
+    assert!(s.contains("another dume is updating this scan"), "{s}");
+    assert!(s.contains("Press c again or rescan to refresh."), "{s}");
+    assert!(!s.contains("did not shrink") && !s.contains("Freed"), "{s}");
+}
+
+#[test]
+fn esc_stops_the_run_and_says_what_was_not_touched() {
+    let e = env();
+    let r = recipes(
+        &e,
+        &[
+            ("nap.sh", "#!/bin/sh\nsleep 0.3\n"),
+            (
+                "s.sql",
+                "-- dume-name: Nap\n-- dume-apply: nap.sh\nSELECT path FROM entries WHERE name REGEXP '^big$'",
+            ),
+        ],
+    );
+    let mut a = app_with(&e, "proj", r);
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('y'));
+    // Stop while the second script naps: two ran, four were never started.
+    let t = Instant::now();
+    while !screen(&mut a).contains("Cleaning: 1 of 6") {
+        assert!(t.elapsed() < Duration::from_secs(20), "run never started");
+        a.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    key(&mut a, KeyCode::Esc);
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(
+        s.contains("You stopped the run: 4 paths were not touched."),
+        "{s}"
+    );
 }

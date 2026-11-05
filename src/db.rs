@@ -611,6 +611,9 @@ pub fn refresh(
     let _lock = lock_writer(db)?;
     let mut conn =
         Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(err)?;
+    // A reader (e.g. a recipe query) can hold the file for up to its own 30 s deadline.
+    conn.busy_timeout(std::time::Duration::from_secs(30))
+        .map_err(err)?;
     let m = meta_of(&conn).map_err(err)?;
     let mut rels = Vec::new();
     for d in dirs {

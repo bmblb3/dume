@@ -65,7 +65,11 @@ struct Outcome {
 const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
 
 fn n_paths(n: usize) -> String {
-    format!("{n} path{}", if n == 1 { "" } else { "s" })
+    plural(n, "path")
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
 /// "X", or "up to X" when a script decides how much it frees.
@@ -209,6 +213,8 @@ pub struct App {
     /// The chosen entry of `picks`, and which of its hits are ticked.
     pick: usize,
     ticks: Vec<bool>,
+    /// Count and size of the ticked hits, kept in step with `ticks`.
+    ticked: (usize, u64),
     psel: usize,
     poff: usize,
     cancel: Arc<AtomicBool>,
@@ -247,6 +253,7 @@ impl App {
             msel: 0,
             pick: 0,
             ticks: Vec::new(),
+            ticked: (0, 0),
             psel: 0,
             poff: 0,
             cancel: Arc::default(),
@@ -565,13 +572,15 @@ impl App {
         )
     }
 
-    fn ticked_size(&self) -> (usize, u64) {
+    fn recount(&mut self) {
         let (_, sel) = self.chosen();
-        sel.hits
+        let t = sel
+            .hits
             .iter()
             .zip(&self.ticks)
             .filter(|(_, t)| **t)
-            .fold((0, 0), |(n, s), (h, _)| (n + 1, s + h.size))
+            .fold((0, 0), |(n, s), (h, _)| (n + 1, s + h.size));
+        self.ticked = t;
     }
 
     fn on_key_menu(&mut self, code: KeyCode) {
@@ -585,6 +594,10 @@ impl App {
                 self.rx = None;
                 self.mode = Mode::List;
             }
+            // A run's rescan must not wait on a recipe query still reading the database.
+            KeyCode::Enter if self.computing() => {
+                self.status = "Still checking recipes — one moment…".into();
+            }
             KeyCode::Enter => {
                 let Some(&i) = shown.get(self.msel) else {
                     return;
@@ -592,6 +605,7 @@ impl App {
                 let Ok(sel) = &self.picks[i].1 else { return };
                 self.ticks = vec![true; sel.hits.len()];
                 (self.pick, self.psel, self.poff) = (i, 0, 0);
+                self.recount();
                 self.mode = Mode::Paths;
             }
             _ => {}
@@ -606,16 +620,23 @@ impl App {
         }
         match key.code {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let all = !self.ticks.iter().all(|&t| t);
+                let all = self.ticked.0 < self.ticks.len();
                 self.ticks.fill(all);
+                self.recount();
             }
             KeyCode::Char(' ') => {
                 if let Some(t) = self.ticks.get_mut(self.psel) {
                     *t = !*t;
+                    let size = self.chosen().1.hits[self.psel].size;
+                    self.ticked = if self.ticks[self.psel] {
+                        (self.ticked.0 + 1, self.ticked.1 + size)
+                    } else {
+                        (self.ticked.0 - 1, self.ticked.1 - size)
+                    };
                 }
                 self.psel = (self.psel + 1).min(len.saturating_sub(1));
             }
-            KeyCode::Enter if self.ticked_size().0 == 0 => {
+            KeyCode::Enter if self.ticked.0 == 0 => {
                 self.status = "Tick at least one path to continue.".into();
             }
             KeyCode::Enter => self.mode = Mode::Confirm,
@@ -955,7 +976,7 @@ impl App {
 
     fn draw_paths(&mut self, f: &mut Frame, area: Rect) {
         let (r, sel) = self.chosen();
-        let (n, size) = self.ticked_size();
+        let (n, size) = self.ticked;
         let title = format!(
             " {}: {n} of {} paths ticked, {} — in {} ",
             r.name,
@@ -999,34 +1020,30 @@ impl App {
 
     fn draw_confirm(&self, f: &mut Frame, area: Rect) {
         let (r, _) = self.chosen();
-        let (n, size) = self.ticked_size();
+        let (n, size) = self.ticked;
+        let ask = match &r.apply {
+            Apply::Delete => format!("Remove {} ({})?", n_paths(n), human(size)),
+            Apply::Script(s) => format!(
+                "Run {} on {}?",
+                s.file_name().unwrap_or_default().to_string_lossy(),
+                plural(n, "file")
+            ),
+        };
         let mut lines = vec![
-            Line::from(format!("In {}", self.root.display())).bold(),
-            Line::from(format!(
-                "clean with \"{}\": {} ({})",
-                r.name,
-                n_paths(n),
-                amount(&r.apply, size)
-            )),
-            Line::from(""),
+            Line::from(format!("{ask} This cannot be undone.")).bold(),
+            Line::from(format!("Folder: {}", self.root.display())),
+            Line::from(format!("Recipe: {}", r.name)),
         ];
         if self.root == self.scan_root {
+            lines.push(Line::from(""));
             lines.push(
-                Line::from(format!(
-                    "Careful: this is the WHOLE scan root, {}.",
-                    self.scan_root.display()
-                ))
+                Line::from(
+                    "This is the top folder of the whole scan: everything ticked below it will be changed.",
+                )
                 .bold()
                 .red(),
             );
         }
-        lines.push(match &r.apply {
-            Apply::Delete => Line::from("This cannot be undone.").bold(),
-            Apply::Script(s) => Line::from(format!(
-                "Runs {} on each file.",
-                s.file_name().unwrap_or_default().to_string_lossy()
-            )),
-        });
         lines.push(Line::from(""));
         lines.push(Line::from("[y] yes, clean   [n] no, go back"));
         f.render_widget(
@@ -1051,22 +1068,38 @@ impl App {
 
     fn draw_done(&self, f: &mut Frame, area: Rect) {
         let Some(o) = &self.outcome else { return };
-        let freed = o.before.saturating_sub(o.after);
-        let mut lines = vec![if freed > 0 {
-            Line::from(format!(
-                "Freed {} here (was {}, now {}).",
-                human(freed),
-                human(o.before),
-                human(o.after)
-            ))
-            .bold()
-        } else {
-            Line::from(format!(
-                "This folder did not shrink: still {}.",
-                human(o.after)
-            ))
-            .bold()
-        }];
+        let mut lines = match &o.rescan {
+            // The database was not updated, so `after` would be the old size: say so instead.
+            Some(e) => vec![
+                Line::from("dume could not measure how much space was freed.").bold(),
+                Line::from(format!("The scan could not be updated: {e}")).yellow(),
+                Line::from("Press c again or rescan to refresh."),
+            ],
+            None => vec![
+                Line::from(match o.after.cmp(&o.before) {
+                    std::cmp::Ordering::Less => format!(
+                        "Freed {} here (was {}, now {}).",
+                        human(o.before - o.after),
+                        human(o.before),
+                        human(o.after)
+                    ),
+                    std::cmp::Ordering::Equal => {
+                        format!("This folder did not shrink: still {}.", human(o.after))
+                    }
+                    std::cmp::Ordering::Greater => format!(
+                        "The folder is now {} (it was {}).",
+                        human(o.after),
+                        human(o.before)
+                    ),
+                })
+                .bold(),
+            ],
+        };
+        let stopped = o
+            .problems
+            .iter()
+            .filter(|(_, v)| matches!(v, Verdict::Skipped(w) if w == "cancelled"))
+            .count();
         let failed = o
             .problems
             .iter()
@@ -1077,8 +1110,15 @@ impl App {
             o.done,
             o.problems.len() - failed
         )));
-        if let Some(e) = &o.rescan {
-            lines.push(Line::from(format!("Could not update the scan afterwards: {e}")).yellow());
+        if stopped > 0 {
+            lines.push(
+                Line::from(format!(
+                    "You stopped the run: {} {} not touched.",
+                    n_paths(stopped),
+                    if stopped == 1 { "was" } else { "were" }
+                ))
+                .bold(),
+            );
         }
         // Only as many reasons as fit.
         let room = (area.height as usize).saturating_sub(lines.len() + 3);
