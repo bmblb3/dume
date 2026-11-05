@@ -17,8 +17,16 @@ First run: *"You have no scan yet. Scan now?"* Later runs: *"Found your scan, ma
 browse it / rescan everything?"* Your scan lives in `~/.local/state/dume/dume.json` (`$XDG_STATE_HOME`,
 or `-f` / `$DUME_JSON`); a `~/dume.json` from an older version is offered for moving.
 
-Keys: `tab`/`1-3` section, `↑↓`/`jk` move, `enter` on a directory pattern lists its matches,
-`enter` again picks a cleaning action, `y` confirms, `N` browses everything in ncdu, `q` quits.
+Two views, with the current directory always shown as a breadcrumb (`/team/root › proj › sweeps`):
+
+1. **Where** (start here): the subdirectories of the current directory, biggest first, ncdu-style.
+   `enter` goes into one, `backspace` (or `h`, `u`, `esc`) goes up.
+2. **What** (`tab`): the patterns that repeat inside the current directory, directories and files in one
+   list (`d` / `f` show only one kind). `enter` on a directory pattern lists its matches, `enter` again
+   picks a cleaning action, `y` confirms. Actions apply to directory patterns only.
+
+Everything in *What* is computed for the directory you are in, so drill down in *Where* first to narrow it.
+`N` browses everything in ncdu, `q` quits.
 
 Patterns are derived from your data (`run_0042` → `run_#`, long hex → `<hex>`); a name must repeat 3+
 times. After an action runs, the touched directories are rescanned and your scan is updated.

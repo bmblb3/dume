@@ -120,7 +120,12 @@ fn browse_pick_confirm_run_and_refresh() {
     let e = env();
     let mut a = app(&e);
     let before = a.report.total;
-    assert!(screen(&mut a).contains("case_#"), "pattern listed");
+    assert!(
+        screen(&mut a).contains("proj/"),
+        "starts in Where, listing subdirectories"
+    );
+    key(&mut a, KeyCode::Tab);
+    assert!(screen(&mut a).contains("case_#"), "What lists the patterns");
 
     key(&mut a, KeyCode::Enter);
     assert_eq!(a.mode, Mode::Matches);
@@ -173,6 +178,7 @@ fn file_patterns_have_no_actions_and_q_quits() {
     let e = env();
     let mut a = app(&e);
     key(&mut a, KeyCode::Tab);
+    key(&mut a, KeyCode::Char('f'));
     key(&mut a, KeyCode::Enter);
     assert_eq!(a.mode, Mode::List);
     assert!(screen(&mut a).contains("directory patterns"));
@@ -223,6 +229,7 @@ fn vanished_directory_is_removed_from_export() {
         actions::load(&e.actions).unwrap().0,
         2,
     );
+    key(&mut a, KeyCode::Tab);
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Enter);
     // Pick the rmdir action: it sorts after "Clean OpenFOAM case".
@@ -385,7 +392,7 @@ fn wrapper_first_run_asks_then_scans() {
     assert_eq!(a.mode, Mode::List);
     assert!(state.exists(), "export written, parent dirs created");
     assert!(!state.with_file_name(".dume.json.tmp").exists());
-    assert!(a.report.files > 0 && screen(&mut a).contains("case_#"));
+    assert!(a.report.files > 0 && screen(&mut a).contains("proj/"));
 }
 
 #[test]
@@ -426,7 +433,7 @@ fn wrapper_browse_existing_and_migrate_legacy() {
     let mut a = launch(&e, &e.export, None);
     key(&mut a, KeyCode::Enter);
     assert_eq!(a.mode, Mode::List);
-    assert!(screen(&mut a).contains("case_#"));
+    assert!(screen(&mut a).contains("proj/"));
 
     // Legacy export gets moved into the new location when the user agrees.
     let new = e.root.parent().unwrap().join("moved/dume.json");
@@ -490,6 +497,8 @@ fn huge_lists_draw_only_what_is_visible() {
         dir_rows: vec![row],
         file_rows: vec![],
         biggest: vec![],
+        children: (0..N).map(|i| (4096, format!("sub_{i:06}"))).collect(),
+        loose: 0,
     };
     let acts = vec![Action {
         name: "noop".into(),
@@ -504,6 +513,20 @@ fn huge_lists_draw_only_what_is_visible() {
         2,
     );
 
+    // The Where list (200k subdirectories) is windowed too.
+    let t = Instant::now();
+    for _ in 0..20 {
+        screen(&mut a);
+    }
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "where view too slow: {:?}",
+        t.elapsed()
+    );
+    key(&mut a, KeyCode::Char('G'));
+    assert!(screen(&mut a).contains("sub_199999"));
+
+    key(&mut a, KeyCode::Tab);
     key(&mut a, KeyCode::Enter);
     let t = Instant::now();
     for _ in 0..20 {
@@ -548,6 +571,7 @@ fn actions_work_on_the_export_kept_in_memory() {
     let e = env();
     let mut a = launch(&e, &e.export, None);
     key(&mut a, KeyCode::Enter); // browse the existing scan (parsed once, at start-up)
+    key(&mut a, KeyCode::Tab);
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Enter);
@@ -572,5 +596,108 @@ fn actions_work_on_the_export_kept_in_memory() {
     assert_eq!(
         tui::load_report(&e.export, &e.root).unwrap().total,
         a.report.total
+    );
+}
+
+// ---- Where / What ----
+
+#[test]
+fn where_drills_into_directories_and_what_is_computed_inside() {
+    let e = env();
+    let mut a = app(&e);
+    let (total, files) = (a.report.total, a.report.files);
+    assert_eq!(a.report.children.len(), 1, "data/ has one subdirectory");
+
+    key(&mut a, KeyCode::Enter); // into proj
+    assert_eq!(a.root, e.root.join("proj"));
+    assert_eq!(a.report.total, total);
+    assert!(screen(&mut a).contains("› proj"), "breadcrumb");
+    assert!(screen(&mut a).contains("case_1/") && screen(&mut a).contains("case_3/"));
+
+    key(&mut a, KeyCode::Enter); // into case_1
+    assert_eq!(a.root, e.root.join("proj/case_1"));
+    assert!(a.report.total < total && a.report.files < files);
+    assert!(screen(&mut a).contains("› proj › case_1"));
+    // Nothing repeats 3+ times inside a single case.
+    key(&mut a, KeyCode::Tab);
+    assert!(screen(&mut a).contains("Nothing repeats"));
+
+    // Backspace goes back up, always to the Where view, restoring report and selection.
+    key(&mut a, KeyCode::Backspace);
+    assert_eq!(a.root, e.root.join("proj"));
+    assert_eq!(a.selected_in(0), 0);
+    assert!(screen(&mut a).contains("case_1/"));
+    key(&mut a, KeyCode::Char('h'));
+    assert_eq!(a.root, e.root);
+    assert_eq!(a.report.total, total);
+    key(&mut a, KeyCode::Backspace); // already at the top: no-op
+    assert_eq!(a.root, e.root);
+
+    // Esc goes up while there is somewhere to go, and only then quits.
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.root, e.root);
+    assert!(!a.quit);
+    key(&mut a, KeyCode::Esc);
+    assert!(a.quit);
+}
+
+#[test]
+fn actions_run_inside_the_chosen_root_and_going_up_is_fresh() {
+    let e = env();
+    let mut a = app(&e);
+    key(&mut a, KeyCode::Enter); // into proj
+    let inside = a.report.total;
+    key(&mut a, KeyCode::Tab);
+    assert!(
+        a.report.dir_rows.iter().any(|r| r.pattern == "case_#"),
+        "relative to proj"
+    );
+
+    key(&mut a, KeyCode::Char('d'));
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('y'));
+    wait_done(&mut a);
+    assert!(a.failed.is_empty(), "{:?}", a.failed);
+    assert!(!e.root.join("proj/case_3/200").exists());
+    assert!(a.report.total < inside);
+    key(&mut a, KeyCode::Char('x'));
+
+    // Going up afterwards shows fresh sizes, not the ones remembered from before the action.
+    key(&mut a, KeyCode::Char('u'));
+    assert_eq!(a.root, e.root);
+    assert_eq!(
+        a.report.total,
+        tui::load_report(&e.export, &e.root).unwrap().total
+    );
+}
+
+#[test]
+fn what_lists_dirs_and_files_with_a_filter() {
+    let e = env();
+    let mut a = app(&e);
+    key(&mut a, KeyCode::Char('2'));
+    let s = screen(&mut a);
+    assert!(
+        s.contains("dir") && s.contains("file") && s.contains("case_#"),
+        "{s}"
+    );
+    assert!(
+        s.contains("controlDict"),
+        "file patterns without extension use the name: {s}"
+    );
+
+    key(&mut a, KeyCode::Char('f'));
+    let s = screen(&mut a);
+    assert!(s.contains("What (files)") && !s.contains("case_#"), "{s}");
+    key(&mut a, KeyCode::Char('f')); // toggles back
+    assert!(screen(&mut a).contains("case_#"));
+    key(&mut a, KeyCode::Char('d'));
+    let s = screen(&mut a);
+    assert!(
+        s.contains("What (dirs)") && s.contains("case_#") && !s.contains("controlDict"),
+        "{s}"
     );
 }

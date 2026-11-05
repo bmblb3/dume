@@ -50,6 +50,10 @@ pub struct Report {
     pub dir_rows: Vec<Row>,
     pub file_rows: Vec<Row>,
     pub biggest: Vec<(u64, String)>,
+    /// Subdirectories of the report root, largest first (name, not path).
+    pub children: Vec<(u64, String)>,
+    /// Disk usage of files directly in the report root.
+    pub loose: u64,
 }
 
 #[derive(Default)]
@@ -59,6 +63,8 @@ struct State {
     dir_groups: HashMap<String, Group>,
     file_groups: HashMap<String, Group>,
     fat: Vec<(u64, String)>,
+    children: Vec<(u64, String)>,
+    loose: u64,
     nfiles: u64,
     ndirs: u64,
     keep_paths: bool,
@@ -119,6 +125,9 @@ fn walk(dir: &[Value], path: &mut String, st: &mut State, is_root: bool) -> u64 
             let outermost = st.active.insert(pat.clone());
             st.ndirs += 1;
             let s = walk(child, path, st, false);
+            if is_root {
+                st.children.push((s, name.to_string()));
+            }
             if outermost {
                 st.active.remove(&pat);
                 let g = st.dir_groups.entry(pat).or_default();
@@ -141,6 +150,9 @@ fn walk(dir: &[Value], path: &mut String, st: &mut State, is_root: bool) -> u64 
             );
             st.nfiles += 1;
             size += d;
+            if is_root {
+                st.loose += d;
+            }
             st.file_groups
                 .entry(file_pattern(name))
                 .or_default()
@@ -199,6 +211,8 @@ pub fn analyse(dir: &[Value], keep_paths: bool) -> Report {
     let total = walk(dir, &mut path, &mut st, true);
     st.fat
         .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    st.children
+        .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     Report {
         total,
         files: st.nfiles,
@@ -206,6 +220,8 @@ pub fn analyse(dir: &[Value], keep_paths: bool) -> Report {
         dir_rows: rows(st.dir_groups),
         file_rows: rows(st.file_groups),
         biggest: st.fat,
+        children: st.children,
+        loose: st.loose,
     }
 }
 
@@ -252,6 +268,8 @@ impl Report {
             dir_rows: Vec::new(),
             file_rows: Vec::new(),
             biggest: Vec::new(),
+            children: Vec::new(),
+            loose: 0,
         }
     }
 

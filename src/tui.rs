@@ -19,7 +19,21 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime};
 
-const SECTIONS: [&str; 3] = ["Directory patterns", "File patterns", "Biggest directories"];
+/// Which kinds of pattern the "What" view lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Filter {
+    All,
+    Dirs,
+    Files,
+}
+
+/// The "What" list entry `sel` (is_dir, index into dir_rows / file_rows) as a directory row.
+fn dir_row<'a>(report: &'a Report, what: &[(bool, usize)], sel: usize) -> Option<&'a Row> {
+    match what.get(sel) {
+        Some(&(true, i)) => report.dir_rows.get(i),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -176,7 +190,8 @@ pub struct App {
     pub failed: Vec<String>,
     /// Set by `N`: the binary should suspend the UI and run ncdu on the export.
     pub want_ncdu: bool,
-    root: PathBuf,
+    /// The directory every list is computed for.
+    pub root: PathBuf,
     export: PathBuf,
     actions: Vec<Action>,
     threads: usize,
@@ -188,13 +203,20 @@ pub struct App {
     ask: Ask,
     progress: Arc<Progress>,
     scan_started: Instant,
-    section: usize,
-    sel: [usize; 3],
+    /// 0 = Where (pick a directory), 1 = What (patterns inside it).
+    view: usize,
+    filter: Filter,
+    /// The What list: `(is_dir, index)` into the report's dir / file rows, largest first.
+    what: Vec<(bool, usize)>,
+    sel: [usize; 2],
     scroll: usize,
     act_sel: usize,
     show_all: bool,
-    /// First visible row of each list (sections 0-2, then the matches view).
-    offsets: [usize; 4],
+    /// Roots we came from (innermost last), with the report and selection to return to.
+    /// The report is dropped after an action, since its sizes are then out of date.
+    stack: Vec<(PathBuf, Option<Report>, [usize; 2])>,
+    /// First visible row of each list: Where, What, then the matches view.
+    offsets: [usize; 3],
     /// The parsed export, kept so it is parsed once per session, not once per screen.
     doc: Option<Export>,
     rx: Option<Receiver<Msg>>,
@@ -214,7 +236,7 @@ impl App {
         actions: Vec<Action>,
         threads: usize,
     ) -> Self {
-        Self {
+        let mut app = Self {
             report,
             mode: Mode::List,
             quit: false,
@@ -233,12 +255,15 @@ impl App {
             ask: Ask::NoExport,
             progress: Arc::default(),
             scan_started: Instant::now(),
-            section: 0,
-            sel: [0; 3],
+            view: 0,
+            filter: Filter::All,
+            what: Vec::new(),
+            sel: [0; 2],
             scroll: 0,
             act_sel: 0,
             show_all: false,
-            offsets: [0; 4],
+            stack: Vec::new(),
+            offsets: [0; 3],
             doc: None,
             rx: None,
             total: 0,
@@ -247,7 +272,9 @@ impl App {
             after: None,
             refresh_err: None,
             running: String::new(),
-        }
+        };
+        app.rebuild_what();
+        app
     }
 
     /// The wrapper: start from nothing and ask what to do about the saved scan.
@@ -352,8 +379,8 @@ impl App {
                     }) {
                         Ok(((r, view), doc)) => {
                             self.doc = Some(doc);
-                            self.report = r;
                             self.root = view;
+                            self.set_report(r);
                             self.mode = Mode::List;
                             self.clamp();
                         }
@@ -376,20 +403,126 @@ impl App {
         }
     }
 
+    fn pick_root(&mut self) {
+        let Some((_, name)) = self.report.children.get(self.sel[0]) else {
+            return;
+        };
+        let new_root = self.root.join(name);
+        let doc = match self
+            .doc
+            .take()
+            .map_or_else(|| Export::load(&self.export), Ok)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("cannot read {}: {e}", self.export.display());
+                return;
+            }
+        };
+        let res = report_of(&doc, &new_root);
+        self.doc = Some(doc);
+        match res {
+            Ok(r) => {
+                let old = std::mem::replace(&mut self.report, r);
+                let old_root = std::mem::replace(&mut self.root, new_root);
+                self.stack.push((old_root, Some(old), self.sel));
+                self.sel = [0; 2];
+                self.offsets = [0; 3];
+                self.view = 0;
+                self.rebuild_what();
+            }
+            Err(e) => self.status = e.to_string(),
+        }
+    }
+
+    fn pop_root(&mut self) {
+        let Some((root, report, sel)) = self.stack.pop() else {
+            return;
+        };
+        let report = report.map_or_else(
+            || {
+                let doc = self
+                    .doc
+                    .take()
+                    .map_or_else(|| Export::load(&self.export), Ok)?;
+                let r = report_of(&doc, &root);
+                self.doc = Some(doc);
+                r
+            },
+            Ok,
+        );
+        match report {
+            Ok(r) => {
+                self.root = root;
+                self.set_report(r);
+                self.sel = sel;
+                self.offsets = [0; 3];
+                self.view = 0;
+                self.clamp();
+            }
+            Err(e) => {
+                self.stack.push((root, None, sel));
+                self.status = e.to_string();
+            }
+        }
+    }
+
+    pub fn selected_in(&self, view: usize) -> usize {
+        self.sel[view]
+    }
+
     pub fn export_path(&self) -> &Path {
         &self.export
     }
 
-    fn len(&self, section: usize) -> usize {
-        match section {
-            0 => self.report.dir_rows.len(),
-            1 => self.report.file_rows.len(),
-            _ => self.report.biggest.len(),
+    fn len(&self, view: usize) -> usize {
+        if view == 0 {
+            self.report.children.len()
+        } else {
+            self.what.len()
+        }
+    }
+
+    /// Rebuild the What list for the current report and filter, largest first.
+    fn rebuild_what(&mut self) {
+        let (d, f) = (&self.report.dir_rows, &self.report.file_rows);
+        let mut v: Vec<(bool, usize)> = Vec::new();
+        if self.filter != Filter::Files {
+            v.extend((0..d.len()).map(|i| (true, i)));
+        }
+        if self.filter != Filter::Dirs {
+            v.extend((0..f.len()).map(|i| (false, i)));
+        }
+        let row = |&(is_dir, i): &(bool, usize)| if is_dir { &d[i] } else { &f[i] };
+        v.sort_by(|a, b| {
+            let (a, b) = (row(a), row(b));
+            b.size.cmp(&a.size).then_with(|| a.pattern.cmp(&b.pattern))
+        });
+        self.what = v;
+        self.clamp();
+    }
+
+    fn set_report(&mut self, r: Report) {
+        self.report = r;
+        self.rebuild_what();
+    }
+
+    fn breadcrumb(&self) -> String {
+        let base = self.scan_root.display().to_string();
+        match self.root.strip_prefix(&self.scan_root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => {
+                let parts: Vec<_> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect();
+                format!("{base} › {}", parts.join(" › "))
+            }
+            _ => self.root.display().to_string(),
         }
     }
 
     fn cur_row(&self) -> Option<&Row> {
-        self.report.dir_rows.get(self.sel[0])
+        dir_row(&self.report, &self.what, self.sel[1])
     }
 
     /// Indices into `actions` offered for the current pattern: matching first.
@@ -404,8 +537,8 @@ impl App {
     }
 
     fn clamp(&mut self) {
-        for s in 0..3 {
-            self.sel[s] = self.sel[s].min(self.len(s).saturating_sub(1));
+        for v in 0..2 {
+            self.sel[v] = self.sel[v].min(self.len(v).saturating_sub(1));
         }
     }
 
@@ -444,26 +577,45 @@ impl App {
             }
             Mode::List => {
                 self.status.clear();
-                if let Some(n) = Self::step(self.sel[self.section], self.len(self.section), code) {
-                    self.sel[self.section] = n;
+                if let Some(n) = Self::step(self.sel[self.view], self.len(self.view), code) {
+                    self.sel[self.view] = n;
                     return;
                 }
+                let open = matches!(code, KeyCode::Enter | KeyCode::Right | KeyCode::Char('l'));
                 match code {
+                    KeyCode::Esc if !self.stack.is_empty() => self.pop_root(),
+                    KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h' | 'u') => {
+                        self.pop_root()
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                     KeyCode::Char('N') => self.want_ncdu = true,
-                    KeyCode::Tab | KeyCode::BackTab => {
-                        let d = if code == KeyCode::Tab { 1 } else { 2 };
-                        self.section = (self.section + d) % 3;
+                    KeyCode::Tab | KeyCode::BackTab => self.view = 1 - self.view,
+                    KeyCode::Char('1') => self.view = 0,
+                    KeyCode::Char('2') => self.view = 1,
+                    KeyCode::Char(c @ ('d' | 'f')) if self.view == 1 => {
+                        let want = if c == 'd' {
+                            Filter::Dirs
+                        } else {
+                            Filter::Files
+                        };
+                        self.filter = if self.filter == want {
+                            Filter::All
+                        } else {
+                            want
+                        };
+                        self.sel[1] = 0;
+                        self.offsets[1] = 0;
+                        self.rebuild_what();
                     }
-                    KeyCode::Char(c @ '1'..='3') => self.section = c as usize - '1' as usize,
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if self.section != 0 => {
-                        self.status = "actions apply to directory patterns (tab 1)".into();
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
-                        if self.cur_row().is_some() =>
-                    {
+                    _ if open && self.view == 0 => self.pick_root(),
+                    _ if open && self.cur_row().is_some() => {
                         self.mode = Mode::Matches;
                         self.scroll = 0;
+                    }
+                    _ if open && !self.what.is_empty() => {
+                        self.status =
+                            "actions apply to directory patterns; press d to show only those"
+                                .into();
                     }
                     _ => {}
                 }
@@ -579,8 +731,8 @@ impl App {
                                 r.files,
                                 self.scan_started.elapsed().as_secs()
                             );
-                            self.report = r;
                             self.root = view;
+                            self.set_report(r);
                             self.mode = Mode::List;
                             self.clamp();
                         }
@@ -593,8 +745,11 @@ impl App {
                 Msg::Finished(res) => {
                     match res {
                         Ok((r, doc)) => {
+                            for s in &mut self.stack {
+                                s.1 = None;
+                            }
                             self.after = Some(r.total);
-                            self.report = r;
+                            self.set_report(r);
                             self.doc = Some(doc);
                         }
                         Err(e) => self.refresh_err = Some(e.to_string()),
@@ -613,26 +768,29 @@ impl App {
             Constraint::Length(2),
         ])
         .areas(f.area());
-        let title = if matches!(self.mode, Mode::Ask | Mode::Scanning) {
-            format!("dume — {}", self.scan_root.display())
+        let lines = if matches!(self.mode, Mode::Ask | Mode::Scanning) {
+            vec![Line::from(format!("dume — {}", self.scan_root.display())).bold()]
         } else {
-            format!(
-                "{}: {} in {} files, {} dirs",
-                self.root.display(),
+            let mut sub = format!(
+                "{} in {} files, {} dirs",
                 human(self.report.total),
                 self.report.files,
                 self.report.dirs
-            )
+            );
+            if self.report.loose > 0 {
+                sub += &format!(" · {} in files directly here", human(self.report.loose));
+            }
+            vec![Line::from(self.breadcrumb()).bold(), Line::from(sub)]
         };
-        f.render_widget(
-            Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)),
-            head,
-        );
+        f.render_widget(Paragraph::new(lines), head);
         let help = match self.mode {
             Mode::Ask => "answer with the keys shown · q quit",
             Mode::Scanning => "scanning — q quits and discards this scan",
+            Mode::List if self.view == 0 => {
+                "↑↓/jk move · enter open dir · backspace up · tab what's inside · N ncdu · q quit"
+            }
             Mode::List => {
-                "↑↓/jk move · tab/1-3 section · enter open (dir patterns) · N browse in ncdu · q quit"
+                "↑↓/jk move · enter open pattern · d dirs · f files · backspace up · tab where · N ncdu · q quit"
             }
             Mode::Matches => "↑↓/jk scroll · enter/a choose action · esc back",
             Mode::Actions => "↑↓/jk select · enter choose · A show all actions · esc back",
@@ -742,29 +900,43 @@ impl App {
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
         let [tabs, table] =
             Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(area);
+        let what = match self.filter {
+            Filter::All => " 2 What ".to_string(),
+            Filter::Dirs => " 2 What (dirs) ".to_string(),
+            Filter::Files => " 2 What (files) ".to_string(),
+        };
         f.render_widget(
-            Tabs::new(SECTIONS.map(|s| format!(" {s} ")))
-                .select(self.section)
+            Tabs::new([" 1 Where ".to_string(), what])
+                .select(self.view)
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
             tabs,
         );
         let total = self.report.total;
-        let s = self.section;
+        let v = self.view;
         // Build only the rows on screen: lists can hold hundreds of thousands of entries.
         let height = table.height.saturating_sub(1) as usize; // minus the header row
-        let (len, sel) = (self.len(s), self.sel[s]);
-        let off = window(self.offsets[s], sel, height, len);
-        self.offsets[s] = off;
+        let (len, sel) = (self.len(v), self.sel[v]);
+        if len == 0 {
+            let msg = if v == 0 {
+                "No subdirectories here. Press tab to see what is inside."
+            } else {
+                "Nothing repeats 3+ times in here."
+            };
+            f.render_widget(Paragraph::new(msg), table);
+            return;
+        }
+        let off = window(self.offsets[v], sel, height, len);
+        self.offsets[v] = off;
         let end = (off + height).min(len);
-        let (rows, widths, header): (Vec<TRow>, Vec<Constraint>, TRow) = if s == 2 {
+        let (rows, widths, header): (Vec<TRow>, Vec<Constraint>, TRow) = if v == 0 {
             (
-                self.report.biggest[off..end]
+                self.report.children[off..end]
                     .iter()
-                    .map(|(s, p)| {
+                    .map(|(s, name)| {
                         TRow::new([
                             human(*s),
                             format!("{:.1}%", pct(*s, total)),
-                            p.trim_start_matches('/').into(),
+                            format!("{name}/"),
                         ])
                     })
                     .collect(),
@@ -773,20 +945,21 @@ impl App {
                     Constraint::Length(7),
                     Constraint::Min(10),
                 ],
-                TRow::new(["SIZE", "%", "PATH"]),
+                TRow::new(["SIZE", "%", "DIRECTORY"]),
             )
         } else {
-            let src = if s == 0 {
-                &self.report.dir_rows
-            } else {
-                &self.report.file_rows
-            };
             (
-                src[off..end]
+                self.what[off..end]
                     .iter()
-                    .map(|r| {
+                    .map(|&(is_dir, i)| {
+                        let r = if is_dir {
+                            &self.report.dir_rows[i]
+                        } else {
+                            &self.report.file_rows[i]
+                        };
                         TRow::new([
-                            Cell::from(r.pattern.clone()),
+                            Cell::from(if is_dir { "dir" } else { "file" }),
+                            r.pattern.clone().into(),
                             r.count.to_string().into(),
                             human(r.size).into(),
                             format!("{:.1}%", pct(r.size, total)).into(),
@@ -795,13 +968,14 @@ impl App {
                     })
                     .collect(),
                 vec![
+                    Constraint::Length(5),
                     Constraint::Length(24),
                     Constraint::Length(8),
                     Constraint::Length(11),
                     Constraint::Length(7),
                     Constraint::Min(10),
                 ],
-                TRow::new(["PATTERN", "COUNT", "SIZE", "%", "LARGEST"]),
+                TRow::new(["TYPE", "PATTERN", "COUNT", "SIZE", "%", "LARGEST"]),
             )
         };
         f.render_stateful_widget(
@@ -810,17 +984,17 @@ impl App {
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("▶ "),
             table,
-            &mut TableState::default().with_selected((len > 0).then(|| sel - off)),
+            &mut TableState::default().with_selected(Some(sel - off)),
         );
     }
 
     fn draw_matches(&mut self, f: &mut Frame, area: Rect) {
-        let Some(row) = self.report.dir_rows.get(self.sel[0]) else {
+        let Some(row) = dir_row(&self.report, &self.what, self.sel[1]) else {
             return;
         };
         let height = area.height.saturating_sub(3) as usize; // borders and header-less table
-        let off = window(self.offsets[3], self.scroll, height, row.dirs.len());
-        self.offsets[3] = off;
+        let off = window(self.offsets[2], self.scroll, height, row.dirs.len());
+        self.offsets[2] = off;
         let end = (off + height).min(row.dirs.len());
         let rows: Vec<TRow> = row.dirs[off..end]
             .iter()
