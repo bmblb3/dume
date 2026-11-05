@@ -22,24 +22,29 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools ncdu file
       - name: Build
         run: cargo build --release --locked --target "$TARGET"
-      - name: Verify binary is fully static
+      - name: Verify binaries are fully static
         run: |
-          bin="target/$TARGET/release/dume"
-          file "$bin"
-          file "$bin" | grep -Eq 'statically linked|static-pie linked'
-          if ldd "$bin" 2>&1 | grep -vq -E 'not a dynamic executable|statically linked'; then
-            echo "binary is dynamically linked"; ldd "$bin"; exit 1
-          fi
+          for b in dume dume-scan; do
+            bin="target/$TARGET/release/$b"
+            file "$bin"
+            file "$bin" | grep -Eq 'statically linked|static-pie linked'
+            if ldd "$bin" 2>&1 | grep -vq -E 'not a dynamic executable|statically linked'; then
+              echo "$b is dynamically linked"; ldd "$bin"; exit 1
+            fi
+          done
       - name: Smoke test with ncdu
         run: |
           bin="target/$TARGET/release/dume"
           "$bin" --version
-          "$bin" . | ncdu -f- -o /dev/null
+          "target/$TARGET/release/dume-scan" --version
+          "target/$TARGET/release/dume-scan" . | ncdu -f- -o /dev/null
       - name: Package
         run: |
           name="dume-${GITHUB_REF_NAME}-${TARGET}"
-          mkdir "$name"
-          cp "target/$TARGET/release/dume" README.md "$name/"
+          mkdir -p "$name/bin" "$name/share"
+          cp "target/$TARGET/release/dume" "target/$TARGET/release/dume-scan" "$name/bin/"
+          cp -r examples/share/dume "$name/share/"
+          cp README.md "$name/"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - name: Publish release

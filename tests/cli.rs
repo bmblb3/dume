@@ -4,7 +4,7 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::process::{Command, Stdio};
 
 fn dume() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dume"))
+    Command::new(env!("CARGO_BIN_EXE_dume-scan"))
 }
 
 fn my_uid() -> u32 {
@@ -212,7 +212,7 @@ fn refuses_terminal_stdout() {
         return;
     }
     let t = tree();
-    let cmd = format!("{} {}", env!("CARGO_BIN_EXE_dume"), t.path().display());
+    let cmd = format!("{} {}", env!("CARGO_BIN_EXE_dume-scan"), t.path().display());
     let o = Command::new("script")
         .args(["-qec", &format!("{cmd}; echo EXIT=$?"), "/dev/null"])
         .stdin(Stdio::null())
@@ -501,4 +501,40 @@ fn report_ignores_rare_names_and_errors_cleanly() {
         2,
         "-n needs --report"
     );
+}
+
+// ---- dume (wrapper) ----
+
+#[test]
+fn wrapper_needs_a_terminal() {
+    let o = Command::new(env!("CARGO_BIN_EXE_dume"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("needs a terminal"));
+}
+
+#[test]
+fn wrapper_explains_a_bad_install_on_a_terminal() {
+    let Ok(sh) = Command::new("script").arg("--version").output() else {
+        return;
+    };
+    if !sh.status.success() {
+        return;
+    }
+    // This test binary is not installed as PREFIX/bin/dume, so the layout check must say so.
+    let cmd = env!("CARGO_BIN_EXE_dume");
+    let o = Command::new("script")
+        .args(["-qec", &format!("{cmd}; echo EXIT=$?"), "/dev/null"])
+        .env_remove("DUME_COMMON")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        s.contains("PREFIX/bin/dume") && s.contains("DUME_COMMON"),
+        "{s}"
+    );
+    assert!(s.contains("EXIT=1"), "{s}");
 }

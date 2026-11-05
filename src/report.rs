@@ -17,6 +17,7 @@ struct Group {
     size: u64,
     best: u64,
     example: String,
+    dirs: Vec<(String, u64)>,
 }
 
 impl Group {
@@ -30,15 +31,37 @@ impl Group {
     }
 }
 
+/// One pattern: how many times it occurs and how much space it holds.
+#[derive(Clone)]
+pub struct Row {
+    pub pattern: String,
+    pub count: u64,
+    pub size: u64,
+    pub example: String,
+    /// Outermost matching directories (relative to the report root, with size), largest first.
+    /// Only filled for directory patterns when asked for.
+    pub dirs: Vec<(String, u64)>,
+}
+
+pub struct Report {
+    pub total: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub dir_rows: Vec<Row>,
+    pub file_rows: Vec<Row>,
+    pub biggest: Vec<(u64, String)>,
+}
+
 #[derive(Default)]
 struct State {
     seen: HashSet<u64>,
     active: HashSet<String>,
-    dirs: HashMap<String, Group>,
-    files: HashMap<String, Group>,
+    dir_groups: HashMap<String, Group>,
+    file_groups: HashMap<String, Group>,
     fat: Vec<(u64, String)>,
     nfiles: u64,
     ndirs: u64,
+    keep_paths: bool,
 }
 
 /// `run_0042` -> `run_#`, `a3f9c2e81b77` -> `<hex>`.
@@ -98,7 +121,11 @@ fn walk(dir: &[Value], path: &mut String, st: &mut State, is_root: bool) -> u64 
             let s = walk(child, path, st, false);
             if outermost {
                 st.active.remove(&pat);
-                st.dirs.entry(pat).or_default().add(s, || path.clone());
+                let g = st.dir_groups.entry(pat).or_default();
+                g.add(s, || path.clone());
+                if st.keep_paths {
+                    g.dirs.push((path.clone(), s));
+                }
             }
             path.truncate(len);
             size += s;
@@ -114,7 +141,7 @@ fn walk(dir: &[Value], path: &mut String, st: &mut State, is_root: bool) -> u64 
             );
             st.nfiles += 1;
             size += d;
-            st.files
+            st.file_groups
                 .entry(file_pattern(name))
                 .or_default()
                 .add(d, || format!("{path}/{name}"));
@@ -127,7 +154,7 @@ fn walk(dir: &[Value], path: &mut String, st: &mut State, is_root: bool) -> u64 
     size
 }
 
-fn human(n: u64) -> String {
+pub fn human(n: u64) -> String {
     let mut v = n as f64;
     for u in ["B", "KiB", "MiB", "GiB", "TiB"] {
         if v < 1024.0 || u == "TiB" {
@@ -142,18 +169,57 @@ fn human(n: u64) -> String {
     unreachable!()
 }
 
+fn rows(groups: HashMap<String, Group>) -> Vec<Row> {
+    let mut rows: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, g)| g.count >= MIN_COUNT)
+        .map(|(pattern, mut g)| {
+            g.dirs
+                .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            Row {
+                pattern,
+                count: g.count,
+                size: g.size,
+                example: g.example,
+                dirs: g.dirs,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.pattern.cmp(&b.pattern)));
+    rows
+}
+
+/// Analyse an export directory array. `keep_paths` also records every matching directory.
+pub fn analyse(dir: &[Value], keep_paths: bool) -> Report {
+    let mut st = State {
+        keep_paths,
+        ..State::default()
+    };
+    let mut path = String::new(); // paths are relative to the report root
+    let total = walk(dir, &mut path, &mut st, true);
+    st.fat
+        .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    Report {
+        total,
+        files: st.nfiles,
+        dirs: st.ndirs,
+        dir_rows: rows(st.dir_groups),
+        file_rows: rows(st.file_groups),
+        biggest: st.fat,
+    }
+}
+
+pub fn pct(size: u64, total: u64) -> f64 {
+    size as f64 * 100.0 / total.max(1) as f64
+}
+
 fn table(
     out: &mut impl Write,
     title: &str,
     total: u64,
-    rows: Vec<(String, Group)>,
+    rows: &[Row],
     top: usize,
 ) -> io::Result<()> {
-    let mut rows: Vec<_> = rows
-        .into_iter()
-        .filter(|(_, g)| g.count >= MIN_COUNT)
-        .collect();
-    rows.sort_by(|a, b| b.1.size.cmp(&a.1.size).then_with(|| a.0.cmp(&b.0)));
     writeln!(out, "\n{title}")?;
     if rows.is_empty() {
         return writeln!(out, "  (none repeated {MIN_COUNT}+ times)");
@@ -163,64 +229,68 @@ fn table(
         "  {:<24} {:>8} {:>11} {:>6}  LARGEST",
         "PATTERN", "COUNT", "SIZE", "%"
     )?;
-    for (pat, g) in rows.into_iter().take(top) {
-        let pct = g.size as f64 * 100.0 / total.max(1) as f64;
+    for r in rows.iter().take(top) {
         writeln!(
             out,
             "  {:<24} {:>8} {:>11} {:>5.1}%  {}",
-            pat,
-            g.count,
-            human(g.size),
-            pct,
-            g.example.trim_start_matches('/')
+            r.pattern,
+            r.count,
+            human(r.size),
+            pct(r.size, total),
+            r.example.trim_start_matches('/')
         )?;
     }
     Ok(())
 }
 
-/// Print the report for `dir` (an export directory array); `root` labels the output.
-pub fn run(dir: &[Value], root: &str, top: usize, out: &mut impl Write) -> io::Result<()> {
-    let mut st = State::default();
-    let mut path = String::new(); // paths print relative to `root`
-    let total = walk(dir, &mut path, &mut st, true);
-    writeln!(
-        out,
-        "{root}: {} in {} files, {} dirs (disk usage, hardlinks once)",
-        human(total),
-        st.nfiles,
-        st.ndirs
-    )?;
-    table(
-        out,
-        "DIRECTORY PATTERNS (outermost match; patterns may overlap)",
-        total,
-        st.dirs.into_iter().collect(),
-        top,
-    )?;
-    table(
-        out,
-        "FILE PATTERNS",
-        total,
-        st.files.into_iter().collect(),
-        top,
-    )?;
+impl Report {
+    pub fn empty() -> Self {
+        Report {
+            total: 0,
+            files: 0,
+            dirs: 0,
+            dir_rows: Vec::new(),
+            file_rows: Vec::new(),
+            biggest: Vec::new(),
+        }
+    }
 
-    st.fat
-        .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    writeln!(
-        out,
-        "\nBIGGEST DIRECTORIES (skipping parents that are >=90% one child)"
-    )?;
-    for (size, p) in st.fat.into_iter().take(top) {
+    pub fn write_text(&self, root: &str, top: usize, out: &mut impl Write) -> io::Result<()> {
         writeln!(
             out,
-            "  {:>11} {:>5.1}%  {}",
-            human(size),
-            size as f64 * 100.0 / total.max(1) as f64,
-            p.trim_start_matches('/')
+            "{root}: {} in {} files, {} dirs (disk usage, hardlinks once)",
+            human(self.total),
+            self.files,
+            self.dirs
         )?;
+        table(
+            out,
+            "DIRECTORY PATTERNS (outermost match; patterns may overlap)",
+            self.total,
+            &self.dir_rows,
+            top,
+        )?;
+        table(out, "FILE PATTERNS", self.total, &self.file_rows, top)?;
+        writeln!(
+            out,
+            "\nBIGGEST DIRECTORIES (skipping parents that are >=90% one child)"
+        )?;
+        for (size, p) in self.biggest.iter().take(top) {
+            writeln!(
+                out,
+                "  {:>11} {:>5.1}%  {}",
+                human(*size),
+                pct(*size, self.total),
+                p.trim_start_matches('/')
+            )?;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Print the report for `dir` (an export directory array); `root` labels the output.
+pub fn run(dir: &[Value], root: &str, top: usize, out: &mut impl Write) -> io::Result<()> {
+    analyse(dir, false).write_text(root, top, out)
 }
 
 #[cfg(test)]

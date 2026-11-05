@@ -12,8 +12,8 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Directories with more entries than this get their stats done in parallel.
 const PAR_THRESHOLD: usize = 512;
@@ -28,8 +28,11 @@ struct Node {
     subs: Vec<usize>,
 }
 
-pub struct Stats {
+/// Live counters, readable from another thread while a scan runs.
+#[derive(Default)]
+pub struct Progress {
     pub files: AtomicU64,
+    pub dirs: AtomicU64,
     pub errors: AtomicU64,
 }
 
@@ -37,7 +40,7 @@ struct Ctx {
     uid: u32,
     dev: u64,
     arena: Mutex<Vec<Node>>,
-    stats: Stats,
+    stats: Arc<Progress>,
     verbose_errors: bool,
 }
 
@@ -45,7 +48,7 @@ impl Ctx {
     fn warn(&self, path: &Path, what: &str, e: impl std::fmt::Display) {
         self.stats.errors.fetch_add(1, Ordering::Relaxed);
         if self.verbose_errors {
-            eprintln!("dume: {what} {}: {e}", path.display());
+            eprintln!("dume-scan: {what} {}: {e}", path.display());
         }
     }
 }
@@ -64,6 +67,17 @@ pub fn scan(
     threads: usize,
     verbose_errors: bool,
 ) -> io::Result<(Scan, u64)> {
+    scan_progress(root, uid, threads, verbose_errors, Arc::default())
+}
+
+/// Like [`scan`], publishing counters to `progress` as it goes.
+pub fn scan_progress(
+    root: &Path,
+    uid: u32,
+    threads: usize,
+    verbose_errors: bool,
+    progress: Arc<Progress>,
+) -> io::Result<(Scan, u64)> {
     let rootfd = open_dir(rustix::fs::CWD, root)?;
     let st = statat(&rootfd, ".", AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     let dev = st.st_dev as u64;
@@ -71,10 +85,7 @@ pub fn scan(
         uid,
         dev,
         arena: Mutex::new(vec![Node::default()]),
-        stats: Stats {
-            files: 0.into(),
-            errors: 0.into(),
-        },
+        stats: progress,
         verbose_errors,
     };
     drop(rootfd);
@@ -123,6 +134,7 @@ struct Listing {
 }
 
 fn read_dir(ctx: &Ctx, path: &Path) -> io::Result<Listing> {
+    ctx.stats.dirs.fetch_add(1, Ordering::Relaxed);
     let fd = open_dir(rustix::fs::CWD, path)?;
     let dir = Dir::read_from(&fd).map_err(io::Error::from)?;
     let mut entries: Vec<(Vec<u8>, FileType)> = Vec::new();

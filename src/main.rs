@@ -1,9 +1,5 @@
-mod json;
-mod merge;
-mod report;
-mod scan;
-
 use clap::Parser;
+use dumelib::{merge, report, scan};
 use std::io::{BufWriter, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,9 +9,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Export only one user's regular files as ncdu JSON.
 ///
-/// Usage: dume /data > dume.json && ncdu -f dume.json
+/// Usage: dume-scan /data > dume.json && ncdu -f dume.json
 #[derive(Parser)]
-#[command(version, max_term_width = 100)]
+#[command(name = "dume-scan", version, max_term_width = 100)]
 struct Cli {
     /// Directory to scan (never crosses into other filesystems or follows symlinks)
     dir: PathBuf,
@@ -45,7 +41,7 @@ fn main() -> ExitCode {
 
     if cli.merge.is_none() && cli.report.is_none() && std::io::stdout().is_terminal() {
         eprintln!(
-            "dume: refusing to write JSON to a terminal; pipe it, e.g. `dume DIR | ncdu -f-` or `dume DIR > dume.json`"
+            "dume-scan: refusing to write JSON to a terminal; pipe it, e.g. `dume-scan DIR | ncdu -f-` or `dume-scan DIR > dume.json`"
         );
         return ExitCode::from(2);
     }
@@ -54,7 +50,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::BrokenPipe {
-                eprintln!("dume: {e}");
+                eprintln!("dume-scan: {e}");
             }
             ExitCode::from(1)
         }
@@ -62,7 +58,6 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> std::io::Result<()> {
-    let err = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
     if let Some(file) = &cli.report {
         let export = merge::Export::load(file)?;
         let rel = export.relative(&cli.dir.canonicalize()?)?;
@@ -73,56 +68,27 @@ fn run(cli: &Cli) -> std::io::Result<()> {
             &mut std::io::stdout().lock(),
         );
     }
-    let mut export = cli.merge.as_deref().map(merge::Export::load).transpose()?;
-    let file_uid = export.as_ref().map(|e| e.uid()).transpose()?;
-    if let (Some(a), Some(b)) = (cli.uid, file_uid)
-        && a != b
-    {
-        return Err(err(format!("export is for uid {b}, not {a}")));
+    if let Some(file) = &cli.merge {
+        let dir = cli.dir.canonicalize()?;
+        let r = merge::refresh(file, &[dir], cli.uid, cli.threads as usize, cli.verbose)?;
+        return summary(r.files, r.errors, r.uid);
     }
+
     let uid = cli
         .uid
-        .or(file_uid)
         .unwrap_or_else(|| rustix::process::getuid().as_raw());
-
     let (scan, dev) = scan::scan(&cli.dir, uid, cli.threads as usize, cli.verbose)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", cli.dir.display())))?;
+    let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
+    let root = cli.dir.to_string_lossy();
+    scan.write(&mut out, &root, dev, uid, env!("CARGO_PKG_VERSION"))?;
+    summary(scan.files, scan.errors, uid)
+}
 
-    if let (Some(export), Some(file)) = (export.as_mut(), cli.merge.as_deref()) {
-        if export.dev().is_some_and(|d| d != dev) {
-            return Err(err(
-                "DIR is on a different filesystem than the export's root".into(),
-            ));
-        }
-        let dir = cli.dir.canonicalize()?;
-        let rel = export.relative(&dir)?;
-        let name = rel.last().map_or("", |s| s.as_str());
-        let mut tree = Vec::new();
-        scan.write_tree(&mut tree, name, None)?;
-        let tree = serde_json::from_slice(&tree).map_err(std::io::Error::other)?;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        export.splice(&rel, tree, ts);
-        // Write beside the target and rename so a crash never leaves a torn file.
-        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        let bytes = export.to_bytes();
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, file).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
-    } else {
-        let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
-        let root = cli.dir.to_string_lossy();
-        scan.write(&mut out, &root, dev, uid, env!("CARGO_PKG_VERSION"))?;
-    }
-
-    eprintln!("dume: {} files for uid {uid}", scan.files);
-    if scan.errors > 0 {
-        eprintln!(
-            "dume: warning: {} entries could not be read (use -v to list)",
-            scan.errors
-        );
+fn summary(files: u64, errors: u64, uid: u32) -> std::io::Result<()> {
+    eprintln!("dume-scan: {files} files for uid {uid}");
+    if errors > 0 {
+        eprintln!("dume-scan: warning: {errors} entries could not be read (use -v to list)");
     }
     Ok(())
 }

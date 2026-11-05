@@ -1,5 +1,6 @@
 //! Replace one directory's subtree inside an existing dume export.
 
+use crate::scan;
 use serde_json::Value;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -33,6 +34,14 @@ impl Export {
             .as_u64()
             .and_then(|u| u.try_into().ok())
             .ok_or_else(|| err("export has no uid; re-create it with this dume version"))
+    }
+
+    /// The root path the export was made from, as recorded.
+    pub fn root_name(&self) -> String {
+        self.doc[3][0]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// Filesystem device of the original scan root.
@@ -120,6 +129,109 @@ fn splice(dir: &mut Vec<Value>, path: &[String], tree: Value) {
     if child.len() == 1 {
         dir.remove(i);
     }
+}
+
+/// Full scan of `root` written to `export` atomically (temp file + rename), so a scan that
+/// is interrupted or fails leaves the previous export intact. Returns the number of files.
+pub fn scan_to_file(
+    root: &Path,
+    export: &Path,
+    uid: u32,
+    threads: usize,
+    progress: std::sync::Arc<scan::Progress>,
+) -> io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (s, dev) = scan::scan_progress(root, uid, threads, false, progress)?;
+    let name = export
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let tmp = export.with_file_name(format!(".{name}.tmp"));
+    if let Some(dir) = export.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let write = || -> io::Result<()> {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let mut w = io::BufWriter::with_capacity(1 << 20, f);
+        s.write(
+            &mut w,
+            &root.to_string_lossy(),
+            dev,
+            uid,
+            env!("CARGO_PKG_VERSION"),
+        )?;
+        std::fs::rename(&tmp, export)
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(s.files)
+}
+
+pub struct Refreshed {
+    pub files: u64,
+    pub errors: u64,
+    pub uid: u32,
+}
+
+/// Rescan each of `dirs` (canonical paths inside the export's root) and splice them into
+/// `file` in one atomic rewrite. A directory that no longer exists is removed from the export.
+pub fn refresh(
+    file: &Path,
+    dirs: &[PathBuf],
+    uid: Option<u32>,
+    threads: usize,
+    verbose: bool,
+) -> io::Result<Refreshed> {
+    let mut export = Export::load(file)?;
+    let uid_file = export.uid()?;
+    if let Some(u) = uid
+        && u != uid_file
+    {
+        return Err(err(format!("export is for uid {uid_file}, not {u}")));
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (mut files, mut errors) = (0, 0);
+    for dir in dirs {
+        let rel = export.relative(dir)?;
+        let name = rel.last().map_or("", |s| s.as_str());
+        let tree = if dir.is_dir() {
+            let (scan, dev) = scan::scan(dir, uid_file, threads, verbose)
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
+            if export.dev().is_some_and(|d| d != dev) {
+                return Err(err(
+                    "DIR is on a different filesystem than the export's root",
+                ));
+            }
+            files += scan.files;
+            errors += scan.errors;
+            let mut buf = Vec::new();
+            scan.write_tree(&mut buf, name, None)?;
+            serde_json::from_slice(&buf).map_err(io::Error::other)?
+        } else if rel.is_empty() {
+            return Err(err(format!("{}: not a directory", dir.display())));
+        } else {
+            serde_json::json!([{ "name": name }])
+        };
+        export.splice(&rel, tree, ts);
+    }
+    // Write beside the target and rename so a crash never leaves a torn file.
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, export.to_bytes())?;
+    std::fs::rename(&tmp, file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(Refreshed {
+        files,
+        errors,
+        uid: uid_file,
+    })
 }
 
 #[cfg(test)]

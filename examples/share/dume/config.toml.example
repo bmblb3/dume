@@ -1,0 +1,8 @@
+# Copy to PREFIX/share/dume/config.toml (keep it admin-writable only; dume refuses otherwise).
+
+# The tree everyone scans. Absolute path.
+root = "/path/to/shared/root"
+
+# Optional.
+# threads = 32      # concurrent stats per scan; lower it if many people scan at once
+# stale_days = 7    # warn when a user's scan is older than this
