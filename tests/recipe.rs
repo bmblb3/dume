@@ -96,10 +96,36 @@ fn scoped_to_here_only() {
             b"proj/case/processor0/100"
         ]
     );
-    // Bypassing the view, or inventing paths, still cannot escape `here`.
-    let sql = "SELECT path FROM main.entries WHERE name REGEXP '^100$' \
+    // Only the view is readable: the whole table is not.
+    let case = root.join("proj/case");
+    for sql in [
+        "SELECT path FROM main.entries",
+        "SELECT e.path FROM entries v JOIN main.entries e ON e.parent = v.path",
+        "SELECT name AS path FROM sqlite_schema",
+        "SELECT value AS path FROM meta",
+    ] {
+        let e = select(&db, &recipe(sql), &case).unwrap_err();
+        assert!(
+            e.contains("prohibited") || e.contains("not authorized"),
+            "{sql}: {e}"
+        );
+    }
+    let s = select(&db, &recipe("SELECT path FROM temp.entries"), &case).unwrap();
+    assert!(s.count > 0);
+    // A subquery aliased `entries` passes the authorizer (SQLite reports the
+    // alias as the accessor), but the Rust filter still keeps hits under `here`.
+    let sql = "WITH entries AS (SELECT * FROM main.entries) SELECT path FROM entries";
+    let s = select(&db, &recipe(sql), &case.join("processor0")).unwrap();
+    assert!(s.count > 0);
+    assert!(
+        s.hits
+            .iter()
+            .all(|h| h.path.starts_with(b"proj/case/processor0/"))
+    );
+    // Invented paths cannot escape `here`.
+    let sql = "SELECT path FROM entries WHERE name REGEXP '^100$' \
                UNION ALL SELECT 'proj/case/nope' UNION ALL SELECT '../x' UNION ALL SELECT x''";
-    let s = select(&db, &recipe(sql), &root.join("proj/case")).unwrap();
+    let s = select(&db, &recipe(sql), &case).unwrap();
     assert_eq!(
         paths(&s),
         [b"proj/case/100".as_slice(), b"proj/case/processor0/100"]
@@ -180,7 +206,14 @@ fn invalid_regex_is_an_error() {
         &root,
     )
     .unwrap_err();
-    assert!(!e.is_empty());
+    assert!(e.contains("REGEXP"), "{e}");
+}
+
+#[test]
+fn non_select_statement_message() {
+    let (_t, root, db) = foam();
+    let e = select(&db, &recipe("BEGIN"), &root).unwrap_err();
+    assert!(e.contains("recipe must be a single SELECT query"), "{e}");
 }
 
 #[test]

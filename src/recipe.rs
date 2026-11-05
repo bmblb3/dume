@@ -12,13 +12,16 @@ use regex::bytes::Regex;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Apply {
@@ -144,15 +147,59 @@ pub struct Selection {
     pub size: u64,
 }
 
+/// Longest a recipe query may run, and the most `path` rows it may return.
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_ROWS: u64 = 5_000_000;
+const REGEX_CACHE: usize = 256;
+
+struct Limits {
+    timeout: Duration,
+    max_rows: u64,
+}
+
 /// Run `r` on a fresh read-only connection that may only SELECT from `entries`,
 /// a temp view of the rows strictly below `here`. Returned paths are mapped back
 /// to real rows under `here`, nested hits dropped, sorted by path.
+///
+/// `name` and `path` are BLOBs, so `name = 'foo'` never matches: use REGEXP or
+/// `CAST('foo' AS BLOB)`. REGEXP uses `regex::bytes`, Unicode-aware by default;
+/// write `(?-u)` to match arbitrary bytes (e.g. `(?-u)\xE9`).
 pub fn select(db: &Db, r: &Recipe, here: &Path) -> Result<Selection, String> {
+    let lim = Limits {
+        timeout: QUERY_TIMEOUT,
+        max_rows: MAX_ROWS,
+    };
+    select_within(db, r, here, lim)
+}
+
+fn select_within(db: &Db, r: &Recipe, here: &Path, lim: Limits) -> Result<Selection, String> {
     let rel = db.rel(here).map_err(|e| e.to_string())?;
     let mut conn = Connection::open_with_flags(db.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| e.to_string())?;
-    sandbox(&mut conn, &rel).map_err(|e| e.to_string())?;
-    let mut paths = run(&conn, &r.sql).map_err(|e| e.to_string())?;
+    let not_query = Arc::new(AtomicBool::new(false));
+    sandbox(&mut conn, &rel, not_query.clone()).map_err(|e| e.to_string())?;
+    let start = Instant::now();
+    let timeout = lim.timeout;
+    conn.progress_handler(1000, Some(move || start.elapsed() > timeout))
+        .map_err(|e| e.to_string())?;
+    let mut paths = run(&conn, &r.sql, lim.max_rows).map_err(|e| match e {
+        Run::Sql(e) if e.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) => {
+            format!("recipe took too long ({} s)", timeout.as_secs())
+        }
+        Run::Sql(_) | Run::NotQuery if not_query.load(Ordering::Relaxed) => {
+            "recipe must be a single SELECT query".into()
+        }
+        Run::Sql(rusqlite::Error::MultipleStatement) | Run::NotQuery => {
+            "recipe must be a single SELECT query".into()
+        }
+        Run::Sql(e) => e.to_string(),
+        Run::Msg(m) => m,
+    })?;
+    // Our own lookups below read main.entries directly.
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .map_err(|e| e.to_string())?;
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .map_err(|e| e.to_string())?;
     paths.retain(|p| under(p, &rel));
     paths.sort_unstable();
     paths.dedup();
@@ -216,7 +263,8 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// REGEXP, the scoped `entries` view, then an authorizer allowing only reads.
-fn sandbox(conn: &mut Connection, rel: &[u8]) -> rusqlite::Result<()> {
+/// `not_query` is set when the authorizer denies anything other than a read.
+fn sandbox(conn: &mut Connection, rel: &[u8], not_query: Arc<AtomicBool>) -> rusqlite::Result<()> {
     let cache = RefCell::new(HashMap::<String, Regex>::new());
     conn.create_scalar_function(
         "regexp",
@@ -238,6 +286,9 @@ fn sandbox(conn: &mut Connection, rel: &[u8]) -> rusqlite::Result<()> {
             };
             let mut c = cache.borrow_mut();
             if !c.contains_key(pat) {
+                if c.len() >= REGEX_CACHE {
+                    c.clear();
+                }
                 let re = Regex::new(pat).map_err(|e| bad(&format!("REGEXP: {e}")))?;
                 c.insert(pat.to_string(), re);
             }
@@ -255,32 +306,63 @@ fn sandbox(conn: &mut Connection, rel: &[u8]) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
         "CREATE TEMP VIEW entries AS SELECT * FROM main.entries WHERE {range}"
     ))?;
-    conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+    conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+        // Only through the temp view: `main.entries` named directly is denied.
+        // shortcut: a subquery aliased `entries` also reports accessor "entries"; the
+        // Rust `under` filter is what guarantees scope. Copy into a TEMP TABLE if that matters.
         AuthAction::Read {
             table_name: "entries",
             ..
-        } => Authorization::Allow,
+        } if ctx.database_name == Some("temp")
+            || (ctx.database_name == Some("main") && ctx.accessor == Some("entries")) =>
+        {
+            Authorization::Allow
+        }
+        AuthAction::Read { .. } => Authorization::Deny,
         AuthAction::Function { function_name }
             if !function_name.eq_ignore_ascii_case("load_extension") =>
         {
             Authorization::Allow
         }
-        _ => Authorization::Deny,
+        AuthAction::Function { .. } => Authorization::Deny,
+        _ => {
+            not_query.store(true, Ordering::Relaxed);
+            Authorization::Deny
+        }
     }))
 }
 
-/// The `path` values of the recipe's single read-only statement.
-fn run(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<u8>>> {
-    let mut st = conn.prepare(sql)?;
-    let no_path = || rusqlite::Error::InvalidColumnName("recipe must return a path column".into());
-    if !st.readonly() {
-        return Err(rusqlite::Error::InvalidQuery);
+enum Run {
+    Sql(rusqlite::Error),
+    NotQuery,
+    Msg(String),
+}
+
+impl From<rusqlite::Error> for Run {
+    fn from(e: rusqlite::Error) -> Run {
+        Run::Sql(e)
     }
-    let i = st.column_index("path").map_err(|_| no_path())?;
+}
+
+/// The `path` values of the recipe's single read-only statement.
+fn run(conn: &Connection, sql: &str, max_rows: u64) -> Result<Vec<Vec<u8>>, Run> {
+    let mut st = conn.prepare(sql)?;
+    if !st.readonly() {
+        return Err(Run::NotQuery);
+    }
+    let i = st
+        .column_index("path")
+        .map_err(|_| Run::Msg("recipe must return a path column".into()))?;
     let mut rows = st.query([])?;
-    let mut out = Vec::new();
+    let (mut out, mut n) = (Vec::new(), 0u64);
     while let Some(row) = rows.next()? {
+        n += 1;
+        if n > max_rows {
+            return Err(Run::Msg(format!(
+                "recipe returned more than {max_rows} rows"
+            )));
+        }
         if let ValueRef::Text(b) | ValueRef::Blob(b) = row.get_ref(i)? {
             out.push(b.to_vec());
         }
@@ -304,6 +386,52 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         fs::set_permissions(t.path(), fs::Permissions::from_mode(0o755)).unwrap();
         t
+    }
+
+    fn tiny_db() -> (tempfile::TempDir, Db) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("r");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("f"), "x").unwrap();
+        let dbp = t.path().join("x.db");
+        let uid = rustix::process::getuid().as_raw();
+        crate::db::scan_to_db(&root, &dbp, uid, 1, Default::default()).unwrap();
+        let db = Db::open_ro(&dbp).unwrap();
+        (t, db)
+    }
+
+    fn rec(sql: &str) -> Recipe {
+        Recipe {
+            name: "t".into(),
+            apply: Apply::Delete,
+            sql: sql.into(),
+            file: PathBuf::new(),
+        }
+    }
+
+    const FOREVER: &str =
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) SELECT i AS path FROM n";
+
+    #[test]
+    fn endless_query_hits_the_deadline() {
+        let (t, db) = tiny_db();
+        let lim = Limits {
+            timeout: std::time::Duration::from_millis(200),
+            max_rows: u64::MAX,
+        };
+        let e = select_within(&db, &rec(FOREVER), &t.path().join("r"), lim).unwrap_err();
+        assert_eq!(e, "recipe took too long (0 s)");
+    }
+
+    #[test]
+    fn too_many_rows_is_an_error() {
+        let (t, db) = tiny_db();
+        let lim = Limits {
+            timeout: QUERY_TIMEOUT,
+            max_rows: 1000,
+        };
+        let e = select_within(&db, &rec(FOREVER), &t.path().join("r"), lim).unwrap_err();
+        assert!(e.contains("more than 1000 rows"), "{e}");
     }
 
     #[test]
