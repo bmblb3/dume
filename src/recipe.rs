@@ -52,20 +52,24 @@ pub fn load(dir: &Path) -> io::Result<(Vec<Recipe>, Vec<String>)> {
 }
 
 fn parse(dir: &Path, path: &Path) -> Result<Recipe, String> {
-    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
-        return Err("not a regular file".into());
-    }
+    regular(path)?;
     check_private(path)?;
     let sql = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
     let (mut name, mut apply) = (None, Apply::Delete);
-    for line in sql.lines().take(30) {
-        let Some(c) = line.trim().strip_prefix("--") else {
-            if line.trim().is_empty() {
-                continue;
+    let mut in_header = true;
+    for line in sql.lines() {
+        let t = line.trim();
+        let c = t.strip_prefix("--").map(str::trim);
+        if in_header && c.is_none() && !t.is_empty() {
+            in_header = false;
+        }
+        let Some(c) = c else { continue };
+        if !in_header {
+            if c.starts_with("dume-name:") || c.starts_with("dume-apply:") {
+                return Err("dume header after the query starts; headers must come first".into());
             }
-            break;
-        };
-        let c = c.trim();
+            continue;
+        }
         if let Some(v) = c.strip_prefix("dume-name:") {
             name = Some(v.trim().to_string()).filter(|n| !n.is_empty());
         } else if let Some(v) = c.strip_prefix("dume-apply:") {
@@ -75,13 +79,27 @@ fn parse(dir: &Path, path: &Path) -> Result<Recipe, String> {
             };
         }
     }
-    let name = name.ok_or("missing `-- dume-name:` header")?;
+    let name = name.ok_or("missing `-- dume-name:` header (headers must come before the query)")?;
     Ok(Recipe {
         name,
         apply,
         sql,
         file: path.to_path_buf(),
     })
+}
+
+/// A regular file, not a symlink (a link could point at a file outside this directory).
+fn regular(path: &Path) -> Result<(), String> {
+    let ft = std::fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .file_type();
+    if ft.is_symlink() {
+        return Err("is a symlink".into());
+    }
+    if !ft.is_file() {
+        return Err("not a regular file".into());
+    }
+    Ok(())
 }
 
 fn script(dir: &Path, name: &str) -> Result<PathBuf, String> {
@@ -91,8 +109,9 @@ fn script(dir: &Path, name: &str) -> Result<PathBuf, String> {
         ));
     }
     let p = dir.join(name);
+    regular(&p).map_err(|e| format!("script `{name}`: {e}"))?;
     let md = std::fs::metadata(&p).map_err(|e| format!("script `{name}`: {e}"))?;
-    if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
+    if md.permissions().mode() & 0o111 == 0 {
         return Err(format!("script `{name}`: not an executable file"));
     }
     check_private(&p)?;
@@ -198,5 +217,59 @@ mod tests {
         let (r, skipped) = load(t.path()).unwrap();
         assert!(r.is_empty(), "{r:?}");
         assert_eq!(skipped.len(), 5, "{skipped:?}");
+    }
+
+    #[test]
+    fn long_license_comment_before_header_still_parses() {
+        let t = dir();
+        let lic = "-- license line\n".repeat(40);
+        put(
+            t.path(),
+            "l.sql",
+            &format!("{lic}-- dume-name: L\n-- dume-apply: run.sh\nSELECT 1;"),
+            0o644,
+        );
+        put(t.path(), "run.sh", "#!/bin/sh\n", 0o755);
+        let (r, skipped) = load(t.path()).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(r[0].apply, Apply::Script(t.path().join("run.sh")));
+    }
+
+    #[test]
+    fn late_apply_header_after_sql_is_skipped_not_defaulted_to_delete() {
+        let t = dir();
+        put(
+            t.path(),
+            "late.sql",
+            "-- dume-name: Late\nSELECT 1;\n-- dume-apply: run.sh\n",
+            0o644,
+        );
+        let (r, skipped) = load(t.path()).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert!(skipped[0].contains("after the query starts"), "{skipped:?}");
+    }
+
+    #[test]
+    fn symlinked_recipe_and_symlinked_script_are_skipped() {
+        use std::os::unix::fs::symlink;
+        let t = dir();
+        let other = dir();
+        put(other.path(), "r.sql", "-- dume-name: R\nSELECT 1;", 0o644);
+        put(other.path(), "s.sh", "#!/bin/sh\n", 0o755);
+        symlink(other.path().join("r.sql"), t.path().join("link.sql")).unwrap();
+        symlink(other.path().join("s.sh"), t.path().join("s.sh")).unwrap();
+        put(
+            t.path(),
+            "x.sql",
+            "-- dume-name: X\n-- dume-apply: s.sh\nSELECT 1;",
+            0o644,
+        );
+        let (r, skipped) = load(t.path()).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(
+            skipped.iter().all(|s| s.contains("is a symlink")),
+            "{skipped:?}"
+        );
     }
 }
