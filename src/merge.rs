@@ -188,6 +188,18 @@ pub fn refresh(
     verbose: bool,
 ) -> io::Result<Refreshed> {
     let mut export = Export::load(file)?;
+    refresh_export(&mut export, file, dirs, uid, threads, verbose)
+}
+
+/// [`refresh`] on an export that is already loaded; `file` is where the result is written.
+pub fn refresh_export(
+    export: &mut Export,
+    file: &Path,
+    dirs: &[PathBuf],
+    uid: Option<u32>,
+    threads: usize,
+    verbose: bool,
+) -> io::Result<Refreshed> {
     let uid_file = export.uid()?;
     if let Some(u) = uid
         && u != uid_file

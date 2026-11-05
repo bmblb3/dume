@@ -466,3 +466,111 @@ fn launch_parts(e: &Env) -> tui::Launch {
         uid: rustix::process::getuid().as_raw(),
     }
 }
+
+// ---- performance regressions ----
+
+#[test]
+fn huge_lists_draw_only_what_is_visible() {
+    use dumelib::report::{Report, Row};
+    const N: u64 = 200_000;
+    let dirs: Vec<(String, u64)> = (0..N)
+        .map(|i| (format!("/proj/case_{i:06}"), 4096))
+        .collect();
+    let row = Row {
+        pattern: "case_#".into(),
+        count: N,
+        size: N * 4096,
+        example: "proj/case_000000".into(),
+        dirs,
+    };
+    let report = Report {
+        total: N * 4096,
+        files: 0,
+        dirs: N,
+        dir_rows: vec![row],
+        file_rows: vec![],
+        biggest: vec![],
+    };
+    let acts = vec![Action {
+        name: "noop".into(),
+        patterns: vec!["case_#".into()],
+        path: PathBuf::from("/bin/true"),
+    }];
+    let mut a = App::new(
+        report,
+        PathBuf::from("/data"),
+        PathBuf::from("/x.json"),
+        acts,
+        2,
+    );
+
+    key(&mut a, KeyCode::Enter);
+    let t = Instant::now();
+    for _ in 0..20 {
+        screen(&mut a);
+    }
+    // Used to be ~100 ms per frame at this size; the real cost is a few hundred microseconds.
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "matches view too slow: {:?}",
+        t.elapsed()
+    );
+
+    // Still reaches the end of the list, with the selection scrolled into view.
+    key(&mut a, KeyCode::Char('G'));
+    let s = screen(&mut a);
+    assert!(
+        s.contains("case_199999") && !s.contains("case_000000"),
+        "{s}"
+    );
+    key(&mut a, KeyCode::Char('g'));
+    assert!(screen(&mut a).contains("case_000000"));
+
+    // Same for the confirm screen.
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Confirm);
+    let t = Instant::now();
+    for _ in 0..20 {
+        screen(&mut a);
+    }
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "confirm too slow: {:?}",
+        t.elapsed()
+    );
+    key(&mut a, KeyCode::Char('G'));
+    assert!(screen(&mut a).contains("case_199999"));
+}
+
+#[test]
+fn actions_work_on_the_export_kept_in_memory() {
+    let e = env();
+    let mut a = launch(&e, &e.export, None);
+    key(&mut a, KeyCode::Enter); // browse the existing scan (parsed once, at start-up)
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('y'));
+    wait_done(&mut a);
+    assert!(a.failed.is_empty(), "{:?}", a.failed);
+    assert!(!e.root.join("proj/case_1/100").exists());
+    let on_disk = tui::load_report(&e.export, &e.root).unwrap();
+    assert_eq!(on_disk.total, a.report.total, "file and screen agree");
+
+    // A second action straight away reuses the refreshed in-memory export.
+    key(&mut a, KeyCode::Char('x'));
+    fs::create_dir_all(e.root.join("proj/case_1/300")).unwrap();
+    fs::write(e.root.join("proj/case_1/300/f"), vec![1u8; 9000]).unwrap();
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('y'));
+    wait_done(&mut a);
+    assert!(!e.root.join("proj/case_1/300").exists());
+    assert_eq!(
+        tui::load_report(&e.export, &e.root).unwrap().total,
+        a.report.total
+    );
+}

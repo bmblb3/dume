@@ -36,8 +36,8 @@ pub enum Mode {
 
 enum Msg {
     Outcome(actions::Outcome),
-    Finished(io::Result<Report>),
-    Scanned(io::Result<(Report, PathBuf)>),
+    Finished(io::Result<(Report, Export)>),
+    Scanned(io::Result<(Report, PathBuf, Export)>),
 }
 
 /// What the start-up screen asks the user.
@@ -64,24 +64,34 @@ pub fn startup(
     legacy: Option<&Path>,
     now: SystemTime,
 ) -> Ask {
+    startup_with_doc(export, scan_root, uid, legacy, now).0
+}
+
+/// [`startup`], also handing back the parsed export when it is usable, so it isn't parsed again.
+pub fn startup_with_doc(
+    export: &Path,
+    scan_root: &Path,
+    uid: u32,
+    legacy: Option<&Path>,
+    now: SystemTime,
+) -> (Ask, Option<Export>) {
     if !export.exists() {
         return match legacy {
-            Some(old) if old.is_file() => Ask::Migrate(old.to_path_buf()),
-            _ => Ask::NoExport,
+            Some(old) if old.is_file() => (Ask::Migrate(old.to_path_buf()), None),
+            _ => (Ask::NoExport, None),
         };
     }
+    let problem = |m: String| (Ask::Problem(m), None);
     let e = match Export::load(export) {
         Ok(e) => e,
-        Err(e) => return Ask::Problem(format!("Your saved scan can't be read ({e}).")),
+        Err(e) => return problem(format!("Your saved scan can't be read ({e}).")),
     };
     if e.uid().ok() != Some(uid) {
-        return Ask::Problem(
-            "Your saved scan was made by an older version or for another user.".into(),
-        );
+        return problem("Your saved scan was made by an older version or for another user.".into());
     }
     let named = e.root_name();
     if Path::new(&named).canonicalize().ok().as_deref() != Some(scan_root) {
-        return Ask::Problem(format!(
+        return problem(format!(
             "Your saved scan is for {named}, but the team root is {}.",
             scan_root.display()
         ));
@@ -91,7 +101,7 @@ pub fn startup(
         .ok()
         .and_then(|t| now.duration_since(t).ok())
         .unwrap_or_default();
-    Ask::Existing { age }
+    (Ask::Existing { age }, Some(e))
 }
 
 /// "just now", "5 minutes", "3 hours", "2 days".
@@ -108,12 +118,29 @@ pub fn age_text(d: Duration) -> String {
 }
 
 /// Report for `view`, or for `scan_root` if `view` has nothing in the export. Returns the dir used.
+/// First visible row so that `sel` is on screen, moving `off` as little as possible.
+fn window(off: usize, sel: usize, height: usize, len: usize) -> usize {
+    if height == 0 {
+        return 0;
+    }
+    let off = off.min(len.saturating_sub(1));
+    if sel < off {
+        sel
+    } else if sel >= off + height {
+        sel + 1 - height
+    } else {
+        off
+    }
+}
+
 pub fn load_view(export: &Path, view: &Path, scan_root: &Path) -> io::Result<(Report, PathBuf)> {
-    match load_report(export, view) {
+    view_of(&Export::load(export)?, view, scan_root)
+}
+
+fn view_of(doc: &Export, view: &Path, scan_root: &Path) -> io::Result<(Report, PathBuf)> {
+    match report_of(doc, view) {
         Ok(r) => Ok((r, view.to_path_buf())),
-        Err(_) if view != scan_root => {
-            Ok((load_report(export, scan_root)?, scan_root.to_path_buf()))
-        }
+        Err(_) if view != scan_root => Ok((report_of(doc, scan_root)?, scan_root.to_path_buf())),
         Err(e) => Err(e),
     }
 }
@@ -133,9 +160,12 @@ pub struct Launch {
 
 /// Build a report for the directory `root` (canonical, inside the export at `export`).
 pub fn load_report(export: &Path, root: &Path) -> io::Result<Report> {
-    let e = Export::load(export)?;
-    let rel = e.relative(root)?;
-    Ok(report::analyse(e.subtree(&rel)?, true))
+    report_of(&Export::load(export)?, root)
+}
+
+fn report_of(doc: &Export, root: &Path) -> io::Result<Report> {
+    let rel = doc.relative(root)?;
+    Ok(report::analyse(doc.subtree(&rel)?, true))
 }
 
 pub struct App {
@@ -163,7 +193,10 @@ pub struct App {
     scroll: usize,
     act_sel: usize,
     show_all: bool,
-    states: [TableState; 4],
+    /// First visible row of each list (sections 0-2, then the matches view).
+    offsets: [usize; 4],
+    /// The parsed export, kept so it is parsed once per session, not once per screen.
+    doc: Option<Export>,
     rx: Option<Receiver<Msg>>,
     total: usize,
     done: usize,
@@ -205,7 +238,8 @@ impl App {
             scroll: 0,
             act_sel: 0,
             show_all: false,
-            states: Default::default(),
+            offsets: [0; 4],
+            doc: None,
             rx: None,
             total: 0,
             done: 0,
@@ -229,13 +263,14 @@ impl App {
     }
 
     fn evaluate(&mut self) {
-        self.ask = startup(
+        let (ask, doc) = startup_with_doc(
             &self.export,
             &self.scan_root,
             self.uid,
             self.legacy.as_deref(),
             SystemTime::now(),
         );
+        (self.ask, self.doc) = (ask, doc);
         self.mode = Mode::Ask;
     }
 
@@ -253,8 +288,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let res = merge::scan_to_file(&scan_root, &export, uid, threads, progress)
-                .and_then(|_| load_view(&export, &view, &scan_root));
+            let res = (|| {
+                merge::scan_to_file(&scan_root, &export, uid, threads, progress)?;
+                let doc = Export::load(&export)?;
+                let (report, view) = view_of(&doc, &view, &scan_root)?;
+                Ok((report, view, doc))
+            })();
             let _ = tx.send(Msg::Scanned(res));
         });
     }
@@ -303,8 +342,16 @@ impl App {
             }
             Ask::Existing { .. } => match code {
                 KeyCode::Enter | KeyCode::Char('b') => {
-                    match load_view(&self.export, &self.root, &self.scan_root) {
-                        Ok((r, view)) => {
+                    let doc = self
+                        .doc
+                        .take()
+                        .map_or_else(|| Export::load(&self.export), Ok);
+                    match doc.and_then(|d| {
+                        let v = view_of(&d, &self.root, &self.scan_root)?;
+                        Ok((v, d))
+                    }) {
+                        Ok(((r, view), doc)) => {
+                            self.doc = Some(doc);
                             self.report = r;
                             self.root = view;
                             self.mode = Mode::List;
@@ -491,6 +538,7 @@ impl App {
         self.rx = Some(rx);
         let (root, export, threads) = (self.root.clone(), self.export.clone(), self.threads);
         let bin = self.bin.clone();
+        let doc = self.doc.take();
         std::thread::spawn(move || {
             for d in &dirs {
                 let _ = tx.send(Msg::Outcome(actions::run_on(
@@ -502,8 +550,11 @@ impl App {
                 )));
             }
             // Rescan what the action touched so the report shows the new sizes.
-            let res = merge::refresh(&export, &dirs, None, threads, false)
-                .and_then(|_| load_report(&export, &root));
+            let res = (|| {
+                let mut doc = doc.map_or_else(|| Export::load(&export), Ok)?;
+                merge::refresh_export(&mut doc, &export, &dirs, None, threads, false)?;
+                Ok((report_of(&doc, &root)?, doc))
+            })();
             let _ = tx.send(Msg::Finished(res));
         });
     }
@@ -521,7 +572,8 @@ impl App {
                 Msg::Scanned(res) => {
                     self.rx = None;
                     match res {
-                        Ok((r, view)) => {
+                        Ok((r, view, doc)) => {
+                            self.doc = Some(doc);
                             self.status = format!(
                                 "Scan finished: {} files in {}s",
                                 r.files,
@@ -540,9 +592,10 @@ impl App {
                 }
                 Msg::Finished(res) => {
                     match res {
-                        Ok(r) => {
+                        Ok((r, doc)) => {
                             self.after = Some(r.total);
                             self.report = r;
+                            self.doc = Some(doc);
                         }
                         Err(e) => self.refresh_err = Some(e.to_string()),
                     }
@@ -696,10 +749,16 @@ impl App {
             tabs,
         );
         let total = self.report.total;
-        let (rows, widths, header): (Vec<TRow>, Vec<Constraint>, TRow) = if self.section == 2 {
+        let s = self.section;
+        // Build only the rows on screen: lists can hold hundreds of thousands of entries.
+        let height = table.height.saturating_sub(1) as usize; // minus the header row
+        let (len, sel) = (self.len(s), self.sel[s]);
+        let off = window(self.offsets[s], sel, height, len);
+        self.offsets[s] = off;
+        let end = (off + height).min(len);
+        let (rows, widths, header): (Vec<TRow>, Vec<Constraint>, TRow) = if s == 2 {
             (
-                self.report
-                    .biggest
+                self.report.biggest[off..end]
                     .iter()
                     .map(|(s, p)| {
                         TRow::new([
@@ -717,13 +776,14 @@ impl App {
                 TRow::new(["SIZE", "%", "PATH"]),
             )
         } else {
-            let src = if self.section == 0 {
+            let src = if s == 0 {
                 &self.report.dir_rows
             } else {
                 &self.report.file_rows
             };
             (
-                src.iter()
+                src[off..end]
+                    .iter()
                     .map(|r| {
                         TRow::new([
                             Cell::from(r.pattern.clone()),
@@ -744,28 +804,28 @@ impl App {
                 TRow::new(["PATTERN", "COUNT", "SIZE", "%", "LARGEST"]),
             )
         };
-        let s = self.section;
-        self.states[s].select((!rows.is_empty()).then_some(self.sel[s]));
         f.render_stateful_widget(
             Table::new(rows, widths)
                 .header(header.style(Style::new().add_modifier(Modifier::BOLD)))
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("▶ "),
             table,
-            &mut self.states[s],
+            &mut TableState::default().with_selected((len > 0).then(|| sel - off)),
         );
     }
 
     fn draw_matches(&mut self, f: &mut Frame, area: Rect) {
-        let Some(row) = self.cur_row().cloned() else {
+        let Some(row) = self.report.dir_rows.get(self.sel[0]) else {
             return;
         };
-        let rows: Vec<TRow> = row
-            .dirs
+        let height = area.height.saturating_sub(3) as usize; // borders and header-less table
+        let off = window(self.offsets[3], self.scroll, height, row.dirs.len());
+        self.offsets[3] = off;
+        let end = (off + height).min(row.dirs.len());
+        let rows: Vec<TRow> = row.dirs[off..end]
             .iter()
             .map(|(p, s)| TRow::new([p.trim_start_matches('/').to_string(), human(*s)]))
             .collect();
-        self.states[3].select((!rows.is_empty()).then_some(self.scroll));
         f.render_stateful_widget(
             Table::new(rows, [Constraint::Min(10), Constraint::Length(11)])
                 .block(Block::bordered().title(format!(
@@ -777,7 +837,8 @@ impl App {
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("▶ "),
             area,
-            &mut self.states[3],
+            &mut TableState::default()
+                .with_selected((!row.dirs.is_empty()).then(|| self.scroll - off)),
         );
     }
 
@@ -821,7 +882,7 @@ impl App {
             return;
         };
         let a = &self.actions[ai];
-        let mut lines = vec![
+        let header = vec![
             Line::from(format!("Run `{}` ({})", a.name, a.path.display())).bold(),
             Line::from(format!(
                 "in each of {} directories matching `{}` ({}), with the directory as working dir.",
@@ -832,17 +893,26 @@ impl App {
             Line::from("Changes are permanent. Press y to run, n to cancel.").red(),
             Line::from(""),
         ];
-        lines.extend(row.dirs.iter().map(|(p, s)| {
-            Line::from(format!(
-                "  {}  ({})",
-                self.root.join(p.trim_start_matches('/')).display(),
-                human(*s)
-            ))
-        }));
+        // Only the lines on screen: a pattern can match hundreds of thousands of directories.
+        let height = area.height.saturating_sub(2) as usize;
+        let skip = self.scroll.min(header.len());
+        let mut lines: Vec<Line> = header.into_iter().skip(skip).collect();
+        lines.extend(
+            row.dirs
+                .iter()
+                .skip(self.scroll.saturating_sub(4))
+                .take(height)
+                .map(|(p, s)| {
+                    Line::from(format!(
+                        "  {}  ({})",
+                        self.root.join(p.trim_start_matches('/')).display(),
+                        human(*s)
+                    ))
+                }),
+        );
+        lines.truncate(height);
         f.render_widget(
-            Paragraph::new(lines)
-                .scroll((self.scroll as u16, 0))
-                .block(Block::bordered().title(" Confirm ")),
+            Paragraph::new(lines).block(Block::bordered().title(" Confirm ")),
             area,
         );
     }

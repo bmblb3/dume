@@ -86,15 +86,26 @@ fn run(cli: &Cli) -> Result<(), String> {
 
     let mut term = ratatui::init();
     let res = (|| -> std::io::Result<()> {
+        let mut redraw = true;
         while !app.quit {
-            term.draw(|f| app.draw(f))?;
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-            {
-                app.on_key(k);
+            // Draw only when something changed (key, resize) or a background job is showing progress.
+            if redraw || matches!(app.mode, tui::Mode::Running | tui::Mode::Scanning) {
+                term.draw(|f| app.draw(f))?;
             }
+            redraw = false;
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        app.on_key(k);
+                        redraw = true;
+                    }
+                    Event::Resize(..) => redraw = true,
+                    _ => {}
+                }
+            }
+            let before = app.mode;
             app.tick();
+            redraw |= app.mode != before;
             if std::mem::take(&mut app.want_ncdu) {
                 ratatui::restore();
                 let ncdu = layout.bin.join("ncdu");
