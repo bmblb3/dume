@@ -5,7 +5,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 struct Env {
@@ -1006,6 +1006,7 @@ fn x_removes_a_single_file() {
     let f = e.root.join("proj/notes.txt");
     assert!(s.contains(&format!("Remove {}?", f.display())), "{s}");
     assert!(s.contains("1 file ("), "{s}");
+    assert!(!s.contains("inside goes too"), "{s}");
     key(&mut a, KeyCode::Char('y'));
     let s = settle(&mut a);
     assert_eq!(a.mode, Mode::Done, "{s}");
@@ -1029,7 +1030,7 @@ fn x_refuses_the_scan_root() {
     );
     key(&mut a, KeyCode::Char('x'));
     assert_eq!(a.mode, Mode::List);
-    assert!(!a.status.is_empty());
+    assert_eq!(a.status, "Nothing to remove here.");
     assert!(e.root.exists());
     // In the scan root, `x` is about the highlighted child, never the root itself.
     let mut a = app(&e);
@@ -1053,7 +1054,7 @@ fn x_confirm_shows_path_count_and_warning_text() {
     let size = human(under(&e, "proj/case_2"));
     assert!(
         s.contains(&format!(
-            "4 files ({size}) according to the last scan — at least this much, your own empty folders and links are removed too."
+            "4 files ({size}). Anything else of yours inside goes too."
         )),
         "{s}"
     );
@@ -1066,7 +1067,7 @@ fn x_confirm_shows_path_count_and_warning_text() {
         "{s}"
     );
     assert!(
-        s.contains("y yes, clean") && s.contains("n/esc back"),
+        s.contains("y yes, remove · n/esc cancel") && !s.contains("clean"),
         "{s}"
     );
 }
@@ -1152,4 +1153,144 @@ fn file_added_after_scan_is_included_because_x_rescans_first() {
     let s = settle(&mut a);
     assert!(s.contains(&format!("Freed {}", human(size))), "{s}");
     assert!(!e.root.join("proj/case_1").exists());
+}
+
+/// `x` on `dir`, esc at once, then wait (without `tick`, so the app never sees the result)
+/// until that rescan has committed and released the lock.
+fn x_esc_unseen(a: &mut App, e: &Env, dir: &str) {
+    let d = e.root.join("proj").join(dir);
+    let files = |p: &Path| Db::open_ro(&e.db).unwrap().entry(p).unwrap().unwrap().files;
+    let before = files(&d);
+    fs::write(d.join("fresh"), b"f").unwrap();
+    highlight(a, e, "proj", dir);
+    key(a, KeyCode::Char('x'));
+    key(a, KeyCode::Esc);
+    let t = Instant::now();
+    while files(&d) == before || db::lock_writer(&e.db).is_err() {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "rescan never finished"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn x_esc_then_c_shows_the_menu_not_a_stale_remove() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    x_esc_unseen(&mut a, &e, "case_1");
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Menu, "{s}");
+    assert!(!s.contains("Remove "), "{s}");
+}
+
+#[test]
+fn x_twice_only_removes_the_second_target() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    x_esc_unseen(&mut a, &e, "case_1");
+    highlight(&mut a, &e, "proj", "case_3");
+    let s = ask_remove(&mut a);
+    assert!(
+        s.contains(&format!("Remove {}?", e.root.join("proj/case_3").display())),
+        "{s}"
+    );
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(!e.root.join("proj/case_3").exists());
+    assert!(e.root.join("proj/case_1").exists() && e.root.join("proj/case_2").exists());
+}
+
+#[test]
+fn x_failed_rescan_says_the_list_may_be_stale() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_1");
+    ask_remove(&mut a);
+    let lock = db::lock_writer(&e.db).unwrap();
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    drop(lock);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(!e.root.join("proj/case_1").exists());
+    assert!(
+        s.contains("dume could not measure how much space was freed."),
+        "{s}"
+    );
+    assert!(
+        s.contains("The list may still show removed items; press c to rescan this folder."),
+        "{s}"
+    );
+    assert!(!s.contains("Press c again"), "{s}");
+}
+
+#[test]
+fn x_refuses_a_row_that_is_now_a_symlink() {
+    let e = env();
+    let outside = e.root.parent().unwrap().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), b"k").unwrap();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_1");
+    let c1 = e.root.join("proj/case_1");
+    fs::remove_dir_all(&c1).unwrap();
+    std::os::unix::fs::symlink(&outside, &c1).unwrap();
+    key(&mut a, KeyCode::Char('x'));
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(
+        a.status,
+        format!(
+            "{} is a symlink; dume does not remove symlinks.",
+            c1.display()
+        )
+    );
+    assert!(outside.join("keep").exists() && c1.symlink_metadata().is_ok());
+}
+
+#[test]
+fn x_does_not_follow_a_symlink_made_after_the_question() {
+    let e = env();
+    let outside = e.root.parent().unwrap().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), b"k").unwrap();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_1");
+    ask_remove(&mut a);
+    let c1 = e.root.join("proj/case_1");
+    fs::remove_dir_all(&c1).unwrap();
+    std::os::unix::fs::symlink(&outside, &c1).unwrap();
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(
+        s.contains(&format!(
+            "Did not remove {}: is now a symlink",
+            c1.display()
+        )),
+        "{s}"
+    );
+    assert!(outside.join("keep").exists() && c1.symlink_metadata().is_ok());
+}
+
+#[test]
+fn x_done_text_for_what_was_left() {
+    use dumelib::apply::Verdict;
+    let p = std::path::Path::new("/d/case_1");
+    let f = |w: &str| vec![(b"case_1".to_vec(), Verdict::Failed(w.into()))];
+    assert_eq!(tui::removed_text(p, &[], 0), "Removed /d/case_1.");
+    assert_eq!(
+        tui::removed_text(p, &f("contains files owned by other people: 100/big"), 3),
+        "Removed everything of yours; left 3 items that belong to other people: 100/big"
+    );
+    assert_eq!(
+        tui::removed_text(p, &f("contains a mount point: scratch"), 0),
+        "Removed everything of yours on this disk; left another disk mounted inside it: scratch"
+    );
+    assert_eq!(
+        tui::removed_text(p, &f("contains a mount point: scratch"), 2),
+        "Removed everything of yours on this disk; left another disk mounted inside it: scratch; also left 2 items that belong to other people."
+    );
 }

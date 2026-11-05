@@ -51,7 +51,13 @@ enum Msg {
     /// `done` of `total` paths handled; `path` was the last one.
     Step(usize, usize, String),
     /// The run finished: paths done, those that were not (with why), and the rescan after.
-    Applied(usize, Vec<(Vec<u8>, Verdict)>, io::Result<db::Refreshed>),
+    /// `x` also sends how many items of other people were left inside the removed folder.
+    Applied(
+        usize,
+        Vec<(Vec<u8>, Verdict)>,
+        io::Result<db::Refreshed>,
+        usize,
+    ),
 }
 
 /// The result of a run, for the Done screen.
@@ -74,18 +80,59 @@ struct Del {
 }
 
 /// Items inside `dir` not owned by `me`, not looking inside them: what removing `dir` leaves.
+/// Other filesystems (mount points) are skipped; `apply::delete` reports those itself.
 #[doc(hidden)]
 pub fn left_by_others(dir: &Path, me: u32) -> usize {
+    dir.symlink_metadata()
+        .map_or(0, |m| count_others(dir, me, m.dev()))
+}
+
+fn count_others(dir: &Path, me: u32, dev: u64) -> usize {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;
     };
     rd.flatten()
         .map(|e| match e.path().symlink_metadata() {
+            Ok(m) if m.dev() != dev => 0,
             Ok(m) if m.uid() != me => 1,
-            Ok(m) if m.is_dir() => left_by_others(&e.path(), me),
+            Ok(m) if m.is_dir() => count_others(&e.path(), me, dev),
             _ => 0,
         })
         .sum()
+}
+
+/// The Done line of `x` for `path`, from the run's problems and [`left_by_others`].
+#[doc(hidden)]
+pub fn removed_text(path: &Path, problems: &[(Vec<u8>, Verdict)], left: usize) -> String {
+    let path = path.display();
+    let others = |n: usize| {
+        format!(
+            "{} that {} to other people",
+            plural(n, "item"),
+            if n == 1 { "belongs" } else { "belong" }
+        )
+    };
+    match problems.first() {
+        None | Some((_, Verdict::Done)) => format!("Removed {path}."),
+        Some((_, Verdict::Failed(w))) if w.starts_with(OTHERS) => format!(
+            "Removed everything of yours; left {}: {}",
+            others(left.max(1)),
+            &w[OTHERS.len()..]
+        ),
+        Some((_, Verdict::Failed(w))) if w.starts_with(MOUNT) => {
+            let mut t = format!(
+                "Removed everything of yours on this disk; left another disk mounted inside it: {}",
+                &w[MOUNT.len()..]
+            );
+            if left > 0 {
+                t += &format!("; also left {}.", others(left));
+            }
+            t
+        }
+        Some((_, Verdict::Failed(w) | Verdict::Skipped(w))) => {
+            format!("Did not remove {path}: {w}")
+        }
+    }
 }
 
 /// How `apply::delete` starts the verdicts for what it had to leave in place.
@@ -517,6 +564,7 @@ impl App {
     /// `c`: rescan `root`, then run every recipe on the refreshed database, in one worker,
     /// so the hits can only come from a database refreshed for this directory just now.
     fn start_clean(&mut self) {
+        self.del = None;
         self.progress = Arc::default();
         self.scan_started = Instant::now();
         self.picks.clear();
@@ -578,6 +626,13 @@ impl App {
             );
             return;
         }
+        if target.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            self.status = format!(
+                "{} is a symlink; dume does not remove symlinks.",
+                target.display()
+            );
+            return;
+        }
         let scan = if c.is_dir {
             target.clone()
         } else {
@@ -603,7 +658,10 @@ impl App {
     fn ask_remove(&mut self, mut d: Del) {
         self.rx = None;
         self.mode = Mode::List;
-        let Some(db) = &self.db else { return };
+        let Some(db) = &self.db else {
+            self.status = "The scan could not be opened, so nothing was removed.".into();
+            return;
+        };
         match db.entry(&d.target) {
             Ok(Some(e)) => {
                 d.files = e.files;
@@ -798,6 +856,7 @@ impl App {
             self.threads,
         );
         let cancel = self.cancel.clone();
+        let del = self.del.as_ref().map(|d| d.target.clone());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
@@ -820,8 +879,15 @@ impl App {
                     let _ = tx.send(Msg::Step(i + 1, total, p));
                 },
             );
+            let kept = |v: &Verdict| matches!(v, Verdict::Failed(w) if w.starts_with(OTHERS) || w.starts_with(MOUNT));
+            let left = match &del {
+                Some(t) if problems.iter().any(|(_, v)| kept(v)) => {
+                    left_by_others(t, rustix::process::getuid().as_raw())
+                }
+                _ => 0,
+            };
             let res = db::refresh(&db, &[here], threads, Arc::default());
-            let _ = tx.send(Msg::Applied(done, problems, res));
+            let _ = tx.send(Msg::Applied(done, problems, res, left));
         });
     }
 
@@ -874,6 +940,7 @@ impl App {
             Mode::Refreshing => {
                 if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                     // The scan can't be interrupted; its result is applied when it ends.
+                    self.del = None;
                     self.mode = Mode::List;
                 }
             }
@@ -929,18 +996,10 @@ impl App {
                 Msg::Refreshed(res) => self.on_refreshed(res),
                 Msg::Picked(i, res) => self.picks.push((i, res)),
                 Msg::Step(done, total, path) => self.step = (done, total, path),
-                Msg::Applied(done, problems, res) => {
+                Msg::Applied(done, problems, res, left) => {
                     self.rx = None;
                     let before = self.total;
                     self.reopen();
-                    let theirs =
-                        |v: &Verdict| matches!(v, Verdict::Failed(w) if w.starts_with(OTHERS));
-                    let left = match &self.del {
-                        Some(d) if problems.iter().any(|(_, v)| theirs(v)) => {
-                            left_by_others(&d.target, rustix::process::getuid().as_raw())
-                        }
-                        _ => 0,
-                    };
                     self.status.clear();
                     self.outcome = Some(Outcome {
                         done,
@@ -983,6 +1042,7 @@ impl App {
             Mode::Paths => {
                 "↑↓ move · space tick/untick · ctrl-a all/none · enter continue · esc back"
             }
+            Mode::Confirm if self.del.is_some() => "y yes, remove · n/esc cancel",
             Mode::Confirm => "y yes, clean · n/esc back",
             Mode::Running => "esc stop after the current path",
             Mode::Done => "any key back to the folder",
@@ -1183,16 +1243,14 @@ impl App {
             let mut lines = vec![Line::from(format!("Remove {}?", d.target.display())).bold()];
             if dir {
                 lines.push(Line::from(format!(
-                    "{} ({size}) according to the last scan — at least this much, your own empty folders and links are removed too.",
+                    "{} ({size}). Anything else of yours inside goes too.",
                     plural(d.files as usize, "file")
                 )));
                 lines.push(Line::from(
                     "Files owned by other people inside it are left alone.",
                 ));
             } else {
-                lines.push(Line::from(format!(
-                    "1 file ({size}) according to the last scan."
-                )));
+                lines.push(Line::from(format!("1 file ({size}).")));
             }
             lines.push(Line::from(
                 "This cannot be undone. Press y to remove, n or esc to cancel.",
@@ -1267,7 +1325,11 @@ impl App {
             Some(e) => vec![
                 Line::from("dume could not measure how much space was freed.").bold(),
                 Line::from(format!("The scan could not be updated: {e}")).yellow(),
-                Line::from("Press c again or rescan to refresh."),
+                Line::from(if self.del.is_some() {
+                    "The list may still show removed items; press c to rescan this folder."
+                } else {
+                    "Press c again or rescan to refresh."
+                }),
             ],
             None => vec![
                 Line::from(match o.after.cmp(&o.before) {
@@ -1290,24 +1352,7 @@ impl App {
             ],
         };
         if let Some(d) = &self.del {
-            let path = d.target.display();
-            lines.push(Line::from(match o.problems.first() {
-                None => format!("Removed {path}."),
-                Some((_, Verdict::Failed(w))) if w.starts_with(OTHERS) => format!(
-                    "Removed everything of yours; left {} that {} to other people: {}",
-                    plural(o.left.max(1), "item"),
-                    if o.left <= 1 { "belongs" } else { "belong" },
-                    &w[OTHERS.len()..]
-                ),
-                Some((_, Verdict::Failed(w))) if w.starts_with(MOUNT) => format!(
-                    "Removed everything of yours on this disk; left another disk mounted inside it: {}",
-                    &w[MOUNT.len()..]
-                ),
-                Some((_, Verdict::Failed(w) | Verdict::Skipped(w))) => {
-                    format!("Did not remove {path}: {w}")
-                }
-                Some((_, Verdict::Done)) => format!("Removed {path}."),
-            }));
+            lines.push(Line::from(removed_text(&d.target, &o.problems, o.left)));
             f.render_widget(
                 Paragraph::new(lines)
                     .wrap(Wrap { trim: false })
