@@ -4,7 +4,7 @@
 
 use crate::apply::{self, Verdict};
 use crate::db::{self, Child, Db};
-use crate::recipe::{self, Apply, Recipe, Selection};
+use crate::recipe::{self, Apply, Hit, Recipe, Selection};
 use crate::report::{human, pct};
 use crate::scan::Progress;
 use ratatui::Frame;
@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Paragraph, Row as TRow, Table, TableState, Wrap};
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,7 +61,36 @@ struct Outcome {
     rescan: Option<String>,
     before: u64,
     after: u64,
+    /// `x`: how many items of other people were left inside the removed folder.
+    left: usize,
 }
+
+/// `x`: the highlighted row being removed. `hit` is filled from the database refreshed in
+/// this same flow, so `apply::run` never sees a row from an older scan.
+struct Del {
+    target: PathBuf,
+    hit: Option<Hit>,
+    files: u64,
+}
+
+/// Items inside `dir` not owned by `me`, not looking inside them: what removing `dir` leaves.
+#[doc(hidden)]
+pub fn left_by_others(dir: &Path, me: u32) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.path().symlink_metadata() {
+            Ok(m) if m.uid() != me => 1,
+            Ok(m) if m.is_dir() => left_by_others(&e.path(), me),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// How `apply::delete` starts the verdicts for what it had to leave in place.
+const OTHERS: &str = "contains files owned by other people: ";
+const MOUNT: &str = "contains a mount point: ";
 
 const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -221,6 +251,7 @@ pub struct App {
     /// Running: (done, total, last path).
     step: (usize, usize, String),
     outcome: Option<Outcome>,
+    del: Option<Del>,
 }
 
 impl App {
@@ -259,6 +290,7 @@ impl App {
             cancel: Arc::default(),
             step: (0, 0, String::new()),
             outcome: None,
+            del: None,
         }
     }
 
@@ -526,7 +558,79 @@ impl App {
         });
     }
 
+    /// `x`: rescan the highlighted row (a file: the folder it is in), then ask.
+    fn start_remove(&mut self) {
+        let Some(c) = self.children.get(self.sel) else {
+            self.status = "Nothing to remove here.".into();
+            return;
+        };
+        let name = Path::new(OsStr::from_bytes(&c.name));
+        let target = self.root.join(name);
+        let plain = name.components().count() == 1
+            && matches!(
+                name.components().next(),
+                Some(std::path::Component::Normal(_))
+            );
+        if !plain || !target.starts_with(&self.scan_root) || target == self.scan_root {
+            self.status = format!(
+                "dume can only remove things inside {}, not that folder itself.",
+                self.scan_root.display()
+            );
+            return;
+        }
+        let scan = if c.is_dir {
+            target.clone()
+        } else {
+            self.root.clone()
+        };
+        self.del = Some(Del {
+            target,
+            hit: None,
+            files: 0,
+        });
+        self.progress = Arc::default();
+        self.scan_started = Instant::now();
+        self.mode = Mode::Refreshing;
+        let (db, threads, progress) = (self.db_path.clone(), self.threads, self.progress.clone());
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Refreshed(db::refresh(&db, &[scan], threads, progress)));
+        });
+    }
+
+    /// `x`, after the rescan: build the one hit from the refreshed database and ask.
+    fn ask_remove(&mut self, mut d: Del) {
+        self.rx = None;
+        self.mode = Mode::List;
+        let Some(db) = &self.db else { return };
+        match db.entry(&d.target) {
+            Ok(Some(e)) => {
+                d.files = e.files;
+                d.hit = Some(Hit {
+                    path: e.rel,
+                    size: e.size,
+                    is_dir: e.is_dir,
+                    mtime: e.mtime.map(|m| m as u64),
+                });
+                self.del = Some(d);
+                self.mode = Mode::Confirm;
+            }
+            Ok(None) if d.target.symlink_metadata().is_err() => {
+                self.status = format!("{} no longer exists.", d.target.display());
+            }
+            Ok(None) => {
+                self.status = format!(
+                    "None of your files are in {} any more; nothing to remove.",
+                    d.target.display()
+                );
+            }
+            Err(e) => self.status = format!("{}: {e}", d.target.display()),
+        }
+    }
+
     fn on_refreshed(&mut self, res: io::Result<db::Refreshed>) {
+        let del = self.del.take();
         if self.mode != Mode::Refreshing {
             // esc'd: apply the finished refresh silently.
             self.rx = None;
@@ -557,7 +661,10 @@ impl App {
         match res {
             Ok(_) => {
                 self.reopen();
-                self.mode = Mode::Menu;
+                match del {
+                    Some(d) => self.ask_remove(d),
+                    None => self.mode = Mode::Menu,
+                }
             }
             Err(e) => {
                 self.rx = None;
@@ -657,16 +764,28 @@ impl App {
     }
 
     fn start_run(&mut self) {
-        let (r, sel) = self.chosen();
-        let recipe = r.clone();
-        // Only the ticked hits, in order: `apply::run` is what keeps them inside `here`.
-        let hits: Vec<_> = sel
-            .hits
-            .iter()
-            .zip(&self.ticks)
-            .filter(|(_, t)| **t)
-            .map(|(h, _)| h.clone())
-            .collect();
+        let (recipe, hits) = if let Some(d) = &self.del {
+            // `x`: one hit with `here` = the folder shown, so the same guards apply.
+            let name = d.target.file_name().unwrap_or_default().to_string_lossy();
+            let r = Recipe {
+                name: format!("Remove {name}"),
+                apply: Apply::Delete,
+                sql: String::new(),
+                file: PathBuf::new(),
+            };
+            (r, d.hit.clone().into_iter().collect())
+        } else {
+            let (r, sel) = self.chosen();
+            // Only the ticked hits, in order: `apply::run` is what keeps them inside `here`.
+            let hits: Vec<_> = sel
+                .hits
+                .iter()
+                .zip(&self.ticks)
+                .filter(|(_, t)| **t)
+                .map(|(h, _)| h.clone())
+                .collect();
+            (r.clone(), hits)
+        };
         self.cancel = Arc::default();
         self.step = (0, hits.len(), String::new());
         self.outcome = None;
@@ -747,6 +866,7 @@ impl App {
                     KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                     KeyCode::Char('N') => self.want_ncdu = true,
                     KeyCode::Char('c') if self.db.is_some() => self.start_clean(),
+                    KeyCode::Char('x') if self.db.is_some() => self.start_remove(),
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_dir(),
                     _ => {}
                 }
@@ -767,6 +887,9 @@ impl App {
             }
             Mode::Confirm => match code {
                 KeyCode::Char('y' | 'Y') => self.start_run(),
+                KeyCode::Esc | KeyCode::Char('n' | 'q') if self.del.take().is_some() => {
+                    self.mode = Mode::List;
+                }
                 KeyCode::Esc | KeyCode::Char('n' | 'q') => self.mode = Mode::Paths,
                 _ => {}
             },
@@ -777,6 +900,7 @@ impl App {
             }
             Mode::Done => {
                 self.status.clear();
+                self.del = None;
                 self.mode = Mode::List;
             }
         }
@@ -809,6 +933,14 @@ impl App {
                     self.rx = None;
                     let before = self.total;
                     self.reopen();
+                    let theirs =
+                        |v: &Verdict| matches!(v, Verdict::Failed(w) if w.starts_with(OTHERS));
+                    let left = match &self.del {
+                        Some(d) if problems.iter().any(|(_, v)| theirs(v)) => {
+                            left_by_others(&d.target, rustix::process::getuid().as_raw())
+                        }
+                        _ => 0,
+                    };
                     self.status.clear();
                     self.outcome = Some(Outcome {
                         done,
@@ -816,6 +948,7 @@ impl App {
                         rescan: res.err().map(|e| e.to_string()),
                         before,
                         after: self.total,
+                        left,
                     });
                     self.mode = Mode::Done;
                 }
@@ -842,7 +975,9 @@ impl App {
         let help = match self.mode {
             Mode::Ask => "answer with the keys shown · q quit",
             Mode::Scanning => "scanning — q quits and discards this scan",
-            Mode::List => "↑↓ move · enter open · ← back · c clean this folder · N ncdu · q quit",
+            Mode::List => {
+                "↑↓ move · enter open · ← back · c clean this folder · x remove · N ncdu · q quit"
+            }
             Mode::Refreshing => "esc back (the update finishes in the background)",
             Mode::Menu => "↑↓ move · enter choose · esc back",
             Mode::Paths => {
@@ -877,11 +1012,23 @@ impl App {
     }
 
     fn draw_refreshing(&self, f: &mut Frame, area: Rect) {
+        let (what, then, title) = match &self.del {
+            Some(d) => (
+                &d.target,
+                "Then dume asks before removing anything.",
+                " Remove ",
+            ),
+            None => (
+                &self.root,
+                "Then dume looks for what can be cleaned here.",
+                " Clean this folder ",
+            ),
+        };
         let lines = vec![
             Line::from(format!(
                 "{} Updating the scan of {} …",
                 self.spinner(),
-                self.root.display()
+                what.display()
             ))
             .bold(),
             Line::from(format!(
@@ -889,10 +1036,10 @@ impl App {
                 self.progress.files.load(Ordering::Relaxed),
                 self.scan_started.elapsed().as_secs()
             )),
-            Line::from("Then dume looks for what can be cleaned here."),
+            Line::from(then),
         ];
         f.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" Clean this folder ")),
+            Paragraph::new(lines).block(Block::bordered().title(title)),
             area,
         );
     }
@@ -1030,6 +1177,34 @@ impl App {
     }
 
     fn draw_confirm(&self, f: &mut Frame, area: Rect) {
+        if let Some(d) = &self.del {
+            let size = human(d.hit.as_ref().map_or(0, |h| h.size));
+            let dir = d.hit.as_ref().is_some_and(|h| h.is_dir);
+            let mut lines = vec![Line::from(format!("Remove {}?", d.target.display())).bold()];
+            if dir {
+                lines.push(Line::from(format!(
+                    "{} ({size}) according to the last scan — at least this much, your own empty folders and links are removed too.",
+                    plural(d.files as usize, "file")
+                )));
+                lines.push(Line::from(
+                    "Files owned by other people inside it are left alone.",
+                ));
+            } else {
+                lines.push(Line::from(format!(
+                    "1 file ({size}) according to the last scan."
+                )));
+            }
+            lines.push(Line::from(
+                "This cannot be undone. Press y to remove, n or esc to cancel.",
+            ));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title(" Are you sure? ")),
+                area,
+            );
+            return;
+        }
         let (r, _) = self.chosen();
         let (n, size) = self.ticked;
         let ask = match &r.apply {
@@ -1067,6 +1242,14 @@ impl App {
 
     fn draw_running(&self, f: &mut Frame, area: Rect) {
         let (done, total, path) = &self.step;
+        if let Some(d) = &self.del {
+            let line = Line::from(format!("Removing {} …", d.target.display())).bold();
+            f.render_widget(
+                Paragraph::new(line).block(Block::bordered().title(" Removing ")),
+                area,
+            );
+            return;
+        }
         let lines = vec![
             Line::from(format!("Cleaning: {done} of {total} paths")).bold(),
             Line::from(path.as_str()),
@@ -1106,6 +1289,33 @@ impl App {
                 .bold(),
             ],
         };
+        if let Some(d) = &self.del {
+            let path = d.target.display();
+            lines.push(Line::from(match o.problems.first() {
+                None => format!("Removed {path}."),
+                Some((_, Verdict::Failed(w))) if w.starts_with(OTHERS) => format!(
+                    "Removed everything of yours; left {} that {} to other people: {}",
+                    plural(o.left.max(1), "item"),
+                    if o.left <= 1 { "belongs" } else { "belong" },
+                    &w[OTHERS.len()..]
+                ),
+                Some((_, Verdict::Failed(w))) if w.starts_with(MOUNT) => format!(
+                    "Removed everything of yours on this disk; left another disk mounted inside it: {}",
+                    &w[MOUNT.len()..]
+                ),
+                Some((_, Verdict::Failed(w) | Verdict::Skipped(w))) => {
+                    format!("Did not remove {path}: {w}")
+                }
+                Some((_, Verdict::Done)) => format!("Removed {path}."),
+            }));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title(" Done ")),
+                area,
+            );
+            return;
+        }
         let stopped = o
             .problems
             .iter()

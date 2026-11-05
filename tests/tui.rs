@@ -744,6 +744,7 @@ fn footer_shows_keys_for_each_mode() {
         "enter open",
         "← back",
         "c clean this folder",
+        "x remove",
         "N ncdu",
         "q quit",
     ] {
@@ -931,4 +932,224 @@ fn esc_stops_the_run_and_says_what_was_not_touched() {
         pos(&s, "You stopped the run") < pos(&s, "did not shrink"),
         "headline first: {s}"
     );
+}
+
+// ---- x: remove the highlighted row ----
+
+/// Highlight `name` in the Where view of `dir` (the list is ordered like `Db::children`).
+fn highlight(a: &mut App, e: &Env, dir: &str, name: &str) {
+    let i = Db::open_ro(&e.db)
+        .unwrap()
+        .children(&e.root.join(dir))
+        .unwrap()
+        .iter()
+        .position(|c| c.name == name.as_bytes())
+        .unwrap_or_else(|| panic!("{name} not in the db"));
+    key(a, KeyCode::Home);
+    for _ in 0..i {
+        key(a, KeyCode::Down);
+    }
+    assert_eq!(a.selected(), i);
+}
+
+/// `x`, then wait for the question.
+fn ask_remove(a: &mut App) -> String {
+    key(a, KeyCode::Char('x'));
+    assert_eq!(a.mode, Mode::Refreshing);
+    let s = settle(a);
+    assert_eq!(a.mode, Mode::Confirm, "status: {}\n{s}", a.status);
+    s
+}
+
+fn under(e: &Env, dir: &str) -> u64 {
+    Db::open_ro(&e.db)
+        .unwrap()
+        .total_under(&e.root.join(dir))
+        .unwrap()
+}
+
+#[test]
+fn x_removes_a_folder_after_y_and_updates_db() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_1");
+    let size = under(&e, "proj/case_1");
+    ask_remove(&mut a);
+    key(&mut a, KeyCode::Char('y'));
+    assert_eq!(a.mode, Mode::Running);
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(!e.root.join("proj/case_1").exists());
+    assert!(e.root.join("proj/case_2").exists() && e.root.join("proj/case_3").exists());
+    assert!(s.contains(&format!("Freed {}", human(size))), "{s}");
+    assert!(s.contains("Removed"), "{s}");
+    let d = Db::open_ro(&e.db).unwrap();
+    assert!(
+        !d.children(&e.root.join("proj"))
+            .unwrap()
+            .iter()
+            .any(|c| c.name == b"case_1")
+    );
+    key(&mut a, KeyCode::Char('j'));
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.root, e.root.join("proj"));
+    assert!(!screen(&mut a).contains("case_1/"));
+}
+
+#[test]
+fn x_removes_a_single_file() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    key(&mut a, KeyCode::Char('G')); // notes.txt, the last row
+    assert_eq!(a.selected(), 3);
+    let s = ask_remove(&mut a);
+    let f = e.root.join("proj/notes.txt");
+    assert!(s.contains(&format!("Remove {}?", f.display())), "{s}");
+    assert!(s.contains("1 file ("), "{s}");
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(!f.exists());
+    assert!(e.root.join("proj/case_1").exists());
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.root, e.root.join("proj"));
+    assert_eq!(a.selected(), 2, "selection clamped to the shorter list");
+}
+
+#[test]
+fn x_refuses_the_scan_root() {
+    let e = env();
+    // Above the scan root (the only place the scan root itself could be a row): nothing to remove.
+    let mut a = App::new(
+        e.db.clone(),
+        e.root.parent().unwrap().to_path_buf(),
+        vec![],
+        2,
+    );
+    key(&mut a, KeyCode::Char('x'));
+    assert_eq!(a.mode, Mode::List);
+    assert!(!a.status.is_empty());
+    assert!(e.root.exists());
+    // In the scan root, `x` is about the highlighted child, never the root itself.
+    let mut a = app(&e);
+    let s = ask_remove(&mut a);
+    assert!(
+        s.contains(&format!("Remove {}?", e.root.join("proj").display())),
+        "{s}"
+    );
+    key(&mut a, KeyCode::Char('n'));
+    assert!(e.root.join("proj").exists());
+}
+
+#[test]
+fn x_confirm_shows_path_count_and_warning_text() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_2");
+    let s = ask_remove(&mut a);
+    let p = e.root.join("proj/case_2");
+    assert!(s.contains(&format!("Remove {}?", p.display())), "{s}");
+    let size = human(under(&e, "proj/case_2"));
+    assert!(
+        s.contains(&format!(
+            "4 files ({size}) according to the last scan — at least this much, your own empty folders and links are removed too."
+        )),
+        "{s}"
+    );
+    assert!(
+        s.contains("Files owned by other people inside it are left alone."),
+        "{s}"
+    );
+    assert!(
+        s.contains("This cannot be undone. Press y to remove, n or esc to cancel."),
+        "{s}"
+    );
+    assert!(
+        s.contains("y yes, clean") && s.contains("n/esc back"),
+        "{s}"
+    );
+}
+
+#[test]
+fn n_or_esc_cancels_and_removes_nothing() {
+    let e = env();
+    let mut a = app_with(&e, "proj", vec![]);
+    let p = e.root.join("proj/case_2");
+    ask_remove(&mut a);
+    key(&mut a, KeyCode::Char('n'));
+    assert_eq!(a.mode, Mode::List);
+    ask_remove(&mut a);
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.root, e.root.join("proj"));
+    // esc while updating: back to Where, and no question pops up when the update ends.
+    key(&mut a, KeyCode::Char('x'));
+    assert_eq!(a.mode, Mode::Refreshing);
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(500) {
+        a.tick();
+        screen(&mut a);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(a.mode, Mode::List);
+    assert!(p.exists() && big_paths(&e).iter().all(|p| p.exists()));
+}
+
+#[test]
+fn x_does_not_touch_siblings() {
+    let e = env();
+    for s in ["case_1x", "case_1.bak", "case_10"] {
+        fs::create_dir(e.root.join("proj").join(s)).unwrap();
+        fs::write(e.root.join("proj").join(s).join("f"), b"keep").unwrap();
+    }
+    db::refresh(&e.db, &[e.root.join("proj")], 2, Default::default()).unwrap();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_1");
+    ask_remove(&mut a);
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(!e.root.join("proj/case_1").exists());
+    let d = Db::open_ro(&e.db).unwrap();
+    for s in ["case_1x", "case_1.bak", "case_10"] {
+        assert!(
+            e.root.join("proj").join(s).join("f").exists(),
+            "{s} removed"
+        );
+        assert_eq!(
+            d.children(&e.root.join("proj").join(s)).unwrap().len(),
+            1,
+            "{s} gone from the db"
+        );
+    }
+}
+
+/// The uid seam (`check_as`/`delete` with a stat fix) is not reachable through the TUI, so the
+/// delete itself is covered in tests/apply.rs; here: counting what other people's items are left.
+#[test]
+fn x_on_folder_with_other_peoples_files_reports_partial() {
+    let e = env();
+    let d = e.root.join("proj/case_1");
+    // As another user, every entry of case_1 (system, 100, 200) is someone else's.
+    assert_eq!(tui::left_by_others(&d, uid() + 1), 3);
+    assert_eq!(tui::left_by_others(&d, uid()), 0);
+}
+
+#[test]
+fn file_added_after_scan_is_included_because_x_rescans_first() {
+    let e = env();
+    fs::write(e.root.join("proj/case_1/late.bin"), vec![1u8; 100 << 10]).unwrap();
+    let mut a = app_with(&e, "proj", vec![]);
+    highlight(&mut a, &e, "proj", "case_1");
+    let s = ask_remove(&mut a);
+    let size = under(&e, "proj/case_1");
+    assert!(size >= 100 << 10);
+    assert!(s.contains(&format!("4 files ({})", human(size))), "{s}");
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert!(s.contains(&format!("Freed {}", human(size))), "{s}");
+    assert!(!e.root.join("proj/case_1").exists());
 }

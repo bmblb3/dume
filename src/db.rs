@@ -143,6 +143,51 @@ impl Db {
             .map_err(err)?;
         Ok(t.unwrap_or(0) as u64)
     }
+
+    /// `p`'s stored row and the number of files at or under it, or None if it isn't stored.
+    pub fn entry(&self, p: &Path) -> io::Result<Option<Entry>> {
+        let rel = self.rel(p)?;
+        let row = self.conn.query_row(
+            "SELECT is_dir, CASE WHEN is_dir THEN tree_size ELSE dsize END, mtime FROM entries WHERE path=?",
+            [&rel],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+        );
+        let (is_dir, size, mtime) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(err(e)),
+        };
+        let files = if is_dir {
+            let (lo, hi) = ([&rel[..], b"/"].concat(), [&rel[..], b"0"].concat());
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE is_dir=0 AND path>=? AND path<?",
+                    [lo, hi],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(err)? as u64
+        } else {
+            1
+        };
+        Ok(Some(Entry {
+            rel,
+            is_dir,
+            size,
+            mtime,
+            files,
+        }))
+    }
+}
+
+/// A stored row, as [`Db::entry`] returns it.
+pub struct Entry {
+    /// Path relative to the scan root.
+    pub rel: Vec<u8>,
+    pub is_dir: bool,
+    /// `tree_size` of a directory, `dsize` of a file.
+    pub size: u64,
+    pub mtime: Option<i64>,
+    pub files: u64,
 }
 
 /// Build a database with `make(tmp)` beside `db` and rename it into place; the
