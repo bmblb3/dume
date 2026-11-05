@@ -6,7 +6,16 @@
 //! SELECT path FROM entries WHERE ...
 //! ```
 
+use crate::db::Db;
 use crate::layout::check_private;
+use regex::bytes::Regex;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -116,6 +125,167 @@ fn script(dir: &Path, name: &str) -> Result<PathBuf, String> {
     }
     check_private(&p)?;
     Ok(p)
+}
+
+/// A selected path (relative to the scan root) with its size: `tree_size`, so
+/// directories count their subtree and repeat hardlinks count 0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hit {
+    pub path: Vec<u8>,
+    pub size: u64,
+    pub is_dir: bool,
+    pub mtime: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Selection {
+    pub hits: Vec<Hit>,
+    pub count: u64,
+    pub size: u64,
+}
+
+/// Run `r` on a fresh read-only connection that may only SELECT from `entries`,
+/// a temp view of the rows strictly below `here`. Returned paths are mapped back
+/// to real rows under `here`, nested hits dropped, sorted by path.
+pub fn select(db: &Db, r: &Recipe, here: &Path) -> Result<Selection, String> {
+    let rel = db.rel(here).map_err(|e| e.to_string())?;
+    let mut conn = Connection::open_with_flags(db.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())?;
+    sandbox(&mut conn, &rel).map_err(|e| e.to_string())?;
+    let mut paths = run(&conn, &r.sql).map_err(|e| e.to_string())?;
+    paths.retain(|p| under(p, &rel));
+    paths.sort_unstable();
+    paths.dedup();
+
+    let mut st = conn
+        .prepare("SELECT is_dir, tree_size, mtime FROM main.entries WHERE path=?")
+        .map_err(|e| e.to_string())?;
+    let mut dirs = HashSet::new();
+    let mut sel = Selection::default();
+    // Sorted, so a directory comes before everything inside it.
+    for path in paths {
+        let inside = path
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'/' && dirs.contains(&path[..i]));
+        if inside {
+            continue;
+        }
+        let row = st.query_row([&path], |row| {
+            Ok((
+                row.get::<_, bool>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        });
+        let (is_dir, size, mtime) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        if is_dir {
+            dirs.insert(path.clone());
+        }
+        sel.size += size as u64;
+        sel.hits.push(Hit {
+            path,
+            size: size as u64,
+            is_dir,
+            mtime: mtime.map(|m| m as u64),
+        });
+    }
+    sel.count = sel.hits.len() as u64;
+    Ok(sel)
+}
+
+/// Strictly below `rel` (the root is the empty path).
+fn under(p: &[u8], rel: &[u8]) -> bool {
+    if rel.is_empty() {
+        !p.is_empty()
+    } else {
+        p.len() > rel.len() && p.starts_with(rel) && p[rel.len()] == b'/'
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::from("x'");
+    for c in b {
+        let _ = write!(s, "{c:02x}");
+    }
+    s + "'"
+}
+
+/// REGEXP, the scoped `entries` view, then an authorizer allowing only reads.
+fn sandbox(conn: &mut Connection, rel: &[u8]) -> rusqlite::Result<()> {
+    let cache = RefCell::new(HashMap::<String, Regex>::new());
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| {
+            let bad = |m: &str| rusqlite::Error::UserFunctionError(m.into());
+            let pat = match ctx.get_raw(0) {
+                ValueRef::Null => return Ok(None),
+                ValueRef::Text(t) => {
+                    std::str::from_utf8(t).map_err(|_| bad("REGEXP pattern is not UTF-8"))?
+                }
+                _ => return Err(bad("REGEXP pattern must be text")),
+            };
+            let v = match ctx.get_raw(1) {
+                ValueRef::Null => return Ok(None),
+                ValueRef::Text(b) | ValueRef::Blob(b) => b,
+                _ => return Err(bad("REGEXP value must be text or blob")),
+            };
+            let mut c = cache.borrow_mut();
+            if !c.contains_key(pat) {
+                let re = Regex::new(pat).map_err(|e| bad(&format!("REGEXP: {e}")))?;
+                c.insert(pat.to_string(), re);
+            }
+            Ok(Some(c[pat].is_match(v)))
+        },
+    )?;
+    let range = if rel.is_empty() {
+        "path > x''".to_string()
+    } else {
+        let (mut lo, mut hi) = (rel.to_vec(), rel.to_vec());
+        lo.push(b'/');
+        hi.push(b'/' + 1);
+        format!("path > {} AND path < {}", hex(&lo), hex(&hi))
+    };
+    conn.execute_batch(&format!(
+        "CREATE TEMP VIEW entries AS SELECT * FROM main.entries WHERE {range}"
+    ))?;
+    conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Read {
+            table_name: "entries",
+            ..
+        } => Authorization::Allow,
+        AuthAction::Function { function_name }
+            if !function_name.eq_ignore_ascii_case("load_extension") =>
+        {
+            Authorization::Allow
+        }
+        _ => Authorization::Deny,
+    }))
+}
+
+/// The `path` values of the recipe's single read-only statement.
+fn run(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<u8>>> {
+    let mut st = conn.prepare(sql)?;
+    let no_path = || rusqlite::Error::InvalidColumnName("recipe must return a path column".into());
+    if !st.readonly() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let i = st.column_index("path").map_err(|_| no_path())?;
+    let mut rows = st.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        if let ValueRef::Text(b) | ValueRef::Blob(b) = row.get_ref(i)? {
+            out.push(b.to_vec());
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

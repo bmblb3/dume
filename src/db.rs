@@ -34,6 +34,7 @@ fn err(e: rusqlite::Error) -> io::Error {
 pub struct Db {
     conn: Connection,
     root: PathBuf,
+    path: PathBuf,
 }
 
 pub struct Meta {
@@ -83,7 +84,16 @@ impl Db {
         let conn =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
         let root = meta_of(&conn).map_err(err)?.root;
-        Ok(Db { conn, root })
+        Ok(Db {
+            conn,
+            root,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// The database file this was opened from.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn meta(&self) -> io::Result<Meta> {
@@ -91,7 +101,7 @@ impl Db {
     }
 
     /// Path relative to the scan root, as stored (empty for the root).
-    fn rel(&self, here: &Path) -> io::Result<Vec<u8>> {
+    pub(crate) fn rel(&self, here: &Path) -> io::Result<Vec<u8>> {
         let r = here
             .strip_prefix(&self.root)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path outside scan root"))?;
