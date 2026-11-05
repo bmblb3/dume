@@ -355,3 +355,425 @@ fn huge_lists_draw_only_what_is_visible() {
     key(&mut a, KeyCode::Char('g'));
     assert!(screen(&mut a).contains("sub_000000"));
 }
+
+// ---- clean flow ----
+
+use dumelib::recipe::{self, Recipe};
+use dumelib::report::human;
+use std::os::unix::fs::PermissionsExt;
+
+/// Recipes from `(file, text)` pairs, loaded the way the app loads them. Scripts end in `.sh`.
+fn recipes(e: &Env, files: &[(&str, &str)]) -> Vec<Recipe> {
+    let dir = e.root.parent().unwrap().join("actions");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, text) in files {
+        let p = dir.join(name);
+        fs::write(&p, text).unwrap();
+        let mode = if name.ends_with(".sh") { 0o755 } else { 0o644 };
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let (r, skipped) = recipe::load(&dir).unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    r
+}
+
+const BIG: (&str, &str) = (
+    "big.sql",
+    "-- dume-name: Time steps\nSELECT path FROM entries WHERE name REGEXP '^big$'",
+);
+const LOGS: (&str, &str) = (
+    "logs.sql",
+    "-- dume-name: Old logs\nSELECT path FROM entries WHERE name REGEXP '\\.log$'",
+);
+const NONE: (&str, &str) = (
+    "none.sql",
+    "-- dume-name: Core dumps\nSELECT path FROM entries WHERE name REGEXP '^core$'",
+);
+
+fn app_with(e: &Env, here: &str, r: Vec<Recipe>) -> App {
+    let here = if here.is_empty() {
+        e.root.clone()
+    } else {
+        e.root.join(here)
+    };
+    App::new(e.db.clone(), here, r, 2)
+}
+
+fn ctrl(a: &mut App, c: char) {
+    a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+}
+
+/// Tick (and draw) until no worker is busy.
+fn settle(a: &mut App) -> String {
+    let t = Instant::now();
+    loop {
+        a.tick();
+        let s = screen(a);
+        if !a.busy() {
+            return s;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "stuck:\n{s}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `c`, then wait for the menu.
+fn menu(a: &mut App) -> String {
+    key(a, KeyCode::Char('c'));
+    assert_eq!(a.mode, Mode::Refreshing);
+    let s = settle(a);
+    assert_eq!(a.mode, Mode::Menu, "{s}");
+    s
+}
+
+fn big_paths(e: &Env) -> Vec<PathBuf> {
+    let mut v = vec![];
+    for i in 1..=3 {
+        for step in ["100", "200"] {
+            v.push(e.root.join(format!("proj/case_{i}/{step}/big")));
+        }
+    }
+    v
+}
+
+#[test]
+fn c_rescans_then_shows_menu_with_counts() {
+    let e = env();
+    fs::write(e.root.join("proj/case_1/run.log"), vec![1u8; 8192]).unwrap();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG, LOGS]));
+    let s = menu(&mut a);
+    assert!(s.contains("Time steps") && s.contains("6 paths"), "{s}");
+    assert!(s.contains("Old logs") && s.contains("1 path"), "{s}");
+    assert!(s.contains(&human(6 * (64 << 10))), "{s}");
+    // The database itself was refreshed, so the Where view sees the new file too.
+    assert!(
+        Db::open_ro(&e.db)
+            .unwrap()
+            .children(&e.root.join("proj/case_1"))
+            .unwrap()
+            .iter()
+            .any(|c| c.name == b"run.log")
+    );
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+}
+
+#[test]
+fn menu_hides_recipes_with_nothing_to_clean() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG, NONE]));
+    let s = menu(&mut a);
+    assert!(s.contains("Time steps") && !s.contains("Core dumps"), "{s}");
+
+    let mut a = app_with(&e, "proj", recipes(&e, &[NONE]));
+    let s = menu(&mut a);
+    assert!(s.contains("Nothing to clean here."), "{s}");
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Menu, "nothing to choose");
+}
+
+#[test]
+fn recipe_error_is_one_line_not_a_crash() {
+    let e = env();
+    let bad = ("bad.sql", "-- dume-name: Broken\nSELECT nope FROM nowhere");
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG, bad]));
+    let s = menu(&mut a);
+    assert!(s.contains("recipe Broken failed:"), "{s}");
+    assert!(s.contains("Time steps"), "{s}");
+}
+
+#[test]
+fn paths_start_ticked_untick_and_ctrl_a() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Paths);
+    let s = screen(&mut a);
+    let k = 64 << 10;
+    assert!(
+        s.contains(&format!("6 of 6 paths ticked, {}", human(6 * k))),
+        "{s}"
+    );
+    assert!(s.contains("case_1/100/big"), "{s}");
+    key(&mut a, KeyCode::Char(' '));
+    let s = screen(&mut a);
+    assert!(
+        s.contains(&format!("5 of 6 paths ticked, {}", human(5 * k))),
+        "{s}"
+    );
+    ctrl(&mut a, 'a');
+    assert!(screen(&mut a).contains("6 of 6 paths ticked"));
+    ctrl(&mut a, 'a');
+    assert!(screen(&mut a).contains("0 of 6 paths ticked"));
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Paths, "needs a ticked path");
+    assert!(screen(&mut a).contains("Tick at least one"));
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::Menu);
+}
+
+#[test]
+fn confirm_names_directory_count_and_total_and_warns_at_scan_root() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Confirm);
+    let s = screen(&mut a);
+    assert!(
+        s.contains(&e.root.join("proj").display().to_string()),
+        "{s}"
+    );
+    assert!(s.contains("Time steps"), "{s}");
+    assert!(
+        s.contains(&format!("6 paths ({})", human(6 * (64 << 10)))),
+        "{s}"
+    );
+    assert!(s.contains("This cannot be undone."), "{s}");
+    assert!(!s.contains("WHOLE scan root"), "{s}");
+    key(&mut a, KeyCode::Char('n'));
+    assert_eq!(a.mode, Mode::Paths);
+    assert!(big_paths(&e).iter().all(|p| p.exists()));
+
+    let mut a = app_with(&e, "", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    let s = screen(&mut a);
+    assert!(s.contains("WHOLE scan root"), "{s}");
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::Paths);
+}
+
+#[test]
+fn only_ticked_paths_are_removed_and_db_updated() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    let before = Db::open_ro(&e.db)
+        .unwrap()
+        .total_under(&e.root.join("proj"))
+        .unwrap();
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char(' ')); // untick case_1/100/big
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('y'));
+    assert_eq!(a.mode, Mode::Running);
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    let paths = big_paths(&e);
+    assert!(paths[0].exists(), "unticked path survives");
+    assert!(paths[1..].iter().all(|p| !p.exists()));
+    assert!(
+        s.contains(&format!("Freed {}", human(5 * (64 << 10)))),
+        "{s}"
+    );
+    assert!(s.contains("5 done"), "{s}");
+
+    let d = Db::open_ro(&e.db).unwrap();
+    let has = |dir: &str| {
+        d.children(&e.root.join(dir))
+            .unwrap()
+            .iter()
+            .any(|c| c.name == b"big")
+    };
+    assert!(has("proj/case_1/100"));
+    assert!(!has("proj/case_1/200") && !has("proj/case_2/100"));
+    assert_eq!(
+        d.total_under(&e.root.join("proj")).unwrap(),
+        before - 5 * (64 << 10)
+    );
+
+    key(&mut a, KeyCode::Char('x'));
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.root, e.root.join("proj"));
+}
+
+#[test]
+fn script_recipe_runs_per_ticked_file() {
+    let e = env();
+    let log = e.root.parent().unwrap().join("ran.txt");
+    let sh = format!("#!/bin/sh\necho \"$1\" >> '{}'\n", log.display());
+    let r = recipes(
+        &e,
+        &[
+            ("touch.sh", &sh),
+            (
+                "s.sql",
+                "-- dume-name: Compress\n-- dume-apply: touch.sh\nSELECT path FROM entries WHERE name REGEXP '^big$'",
+            ),
+        ],
+    );
+    let mut a = app_with(&e, "proj", r);
+    let s = menu(&mut a);
+    assert!(s.contains("up to"), "{s}");
+    key(&mut a, KeyCode::Enter);
+    assert!(screen(&mut a).contains("up to"));
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Char(' ')); // untick case_1/200/big
+    key(&mut a, KeyCode::Enter);
+    let s = screen(&mut a);
+    assert!(s.contains("Runs touch.sh on each file"), "{s}");
+    assert!(!s.contains("cannot be undone"), "{s}");
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    let ran = fs::read_to_string(&log).unwrap();
+    let mut want: Vec<_> = big_paths(&e)
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    want.remove(1);
+    assert_eq!(ran.lines().collect::<Vec<_>>(), want);
+    // The files are still there and the honest result says nothing shrank.
+    assert!(big_paths(&e).iter().all(|p| p.exists()));
+    assert!(s.contains("did not shrink"), "{s}");
+}
+
+#[test]
+fn esc_during_refresh_cancels_and_keeps_db() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    fs::write(e.root.join("proj/late.txt"), b"late").unwrap();
+    key(&mut a, KeyCode::Char('c'));
+    assert_eq!(a.mode, Mode::Refreshing);
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.root, e.root.join("proj"));
+    assert!(screen(&mut a).contains("case_2/"));
+    // The background refresh finishes and is applied silently, without leaving Where.
+    let t = Instant::now();
+    while !screen(&mut a).contains("late.txt") {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "refresh never applied"
+        );
+        a.tick();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(a.mode, Mode::List);
+    assert!(big_paths(&e).iter().all(|p| p.exists()));
+    assert!(screen(&mut a).contains("case_2/"));
+
+    // Another writer holds the lock: a plain message, back in Where.
+    let lock = db::lock_writer(&e.db).unwrap();
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::List, "{s}");
+    assert!(
+        a.status.contains("another dume is updating this scan"),
+        "{}",
+        a.status
+    );
+    drop(lock);
+    menu(&mut a);
+}
+
+#[test]
+fn deleted_here_returns_to_where_with_message() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    key(&mut a, KeyCode::Char('G')); // notes.txt
+    key(&mut a, KeyCode::Up); // case_3
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.root, e.root.join("proj/case_3"));
+    fs::remove_dir_all(e.root.join("proj/case_3")).unwrap();
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::List, "{s}");
+    assert_eq!(a.root, e.root.join("proj"));
+    assert!(a.status.contains("no longer exists"), "{}", a.status);
+    assert!(!s.contains("case_3/"), "db refreshed: {s}");
+
+    // Replaced by a file: the same.
+    key(&mut a, KeyCode::Home);
+    key(&mut a, KeyCode::Enter);
+    let here = a.root.clone();
+    assert_ne!(here, e.root.join("proj"));
+    fs::remove_dir_all(&here).unwrap();
+    fs::write(&here, "now a file").unwrap();
+    key(&mut a, KeyCode::Char('c'));
+    settle(&mut a);
+    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.root, e.root.join("proj"));
+    assert!(a.status.contains("no longer exists"), "{}", a.status);
+}
+
+#[test]
+fn footer_shows_keys_for_each_mode() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    let s = screen(&mut a);
+    for k in [
+        "↑↓ move",
+        "enter open",
+        "← back",
+        "c clean this folder",
+        "N ncdu",
+        "q quit",
+    ] {
+        assert!(s.contains(k), "Where footer lacks {k}: {s}");
+    }
+    key(&mut a, KeyCode::Char('c'));
+    assert!(screen(&mut a).contains("esc back"));
+    let s = settle(&mut a);
+    assert!(s.contains("enter choose") && s.contains("esc back"), "{s}");
+    key(&mut a, KeyCode::Enter);
+    let s = screen(&mut a);
+    for k in [
+        "space tick/untick",
+        "ctrl-a all/none",
+        "enter continue",
+        "esc back",
+    ] {
+        assert!(s.contains(k), "Paths footer lacks {k}: {s}");
+    }
+    key(&mut a, KeyCode::Enter);
+    let s = screen(&mut a);
+    assert!(
+        s.contains("y yes, clean") && s.contains("n/esc back"),
+        "{s}"
+    );
+    key(&mut a, KeyCode::Char('y'));
+    assert!(screen(&mut a).contains("esc stop after the current path"));
+    settle(&mut a);
+    assert!(screen(&mut a).contains("any key"));
+}
+
+#[test]
+fn huge_selection_draws_only_visible_paths() {
+    const N: usize = 20_000;
+    let e = env();
+    let many = e.root.join("many");
+    fs::create_dir(&many).unwrap();
+    for i in 0..N {
+        fs::write(many.join(format!("f_{i:06}")), b"x").unwrap();
+    }
+    let r = recipes(
+        &e,
+        &[(
+            "f.sql",
+            "-- dume-name: All f\nSELECT path FROM entries WHERE name REGEXP '^f_'",
+        )],
+    );
+    let mut a = app_with(&e, "many", r);
+    let s = menu(&mut a);
+    assert!(s.contains(&format!("{N} paths")), "{s}");
+    key(&mut a, KeyCode::Enter);
+    let t = Instant::now();
+    for _ in 0..50 {
+        screen(&mut a);
+    }
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "paths view too slow: {:?}",
+        t.elapsed()
+    );
+    key(&mut a, KeyCode::End);
+    let s = screen(&mut a);
+    assert!(s.contains("f_019999") && !s.contains("f_000000"), "{s}");
+}

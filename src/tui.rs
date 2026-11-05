@@ -2,8 +2,9 @@
 //!
 //! The state machine (`App::on_key` / `App::tick`) is separate from drawing so it can be tested.
 
+use crate::apply::{self, Verdict};
 use crate::db::{self, Child, Db};
-use crate::recipe::Recipe;
+use crate::recipe::{self, Apply, Recipe, Selection};
 use crate::report::{human, pct};
 use crate::scan::Progress;
 use ratatui::Frame;
@@ -17,7 +18,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -28,6 +29,12 @@ pub enum Mode {
     Scanning,
     /// The Where view: the current directory's children, largest first.
     List,
+    /// After `c`: rescanning the current directory before choosing what to clean.
+    Refreshing,
+    /// The recipes that found something here.
+    Menu,
+    /// The paths the chosen recipe found, to tick or untick.
+    Paths,
     Confirm,
     Running,
     Done,
@@ -36,6 +43,41 @@ pub enum Mode {
 enum Msg {
     /// A full scan finished, with the number of files kept.
     Scanned(io::Result<u64>),
+    /// The current directory was rescanned (`c`).
+    Refreshed(io::Result<db::Refreshed>),
+    /// Recipe `i` ran on the refreshed database.
+    Picked(usize, Result<Selection, String>),
+    /// `done` of `total` paths handled; `path` was the last one.
+    Step(usize, usize, String),
+    /// The run finished: paths done, those that were not (with why), and the rescan after.
+    Applied(usize, Vec<(Vec<u8>, Verdict)>, io::Result<db::Refreshed>),
+}
+
+/// The result of a run, for the Done screen.
+struct Outcome {
+    done: usize,
+    problems: Vec<(Vec<u8>, Verdict)>,
+    rescan: Option<String>,
+    before: u64,
+    after: u64,
+}
+
+const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
+
+fn n_paths(n: usize) -> String {
+    format!("{n} path{}", if n == 1 { "" } else { "s" })
+}
+
+/// "X", or "up to X" when a script decides how much it frees.
+fn amount(apply: &Apply, size: u64) -> String {
+    match apply {
+        Apply::Delete => human(size),
+        Apply::Script(_) => format!("up to {}", human(size)),
+    }
+}
+
+fn is_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
 /// What the start-up screen asks the user.
@@ -141,9 +183,7 @@ pub struct App {
     db_path: PathBuf,
     /// Reopened after every scan: a scan renames a new file over the old one.
     db: Option<Db>,
-    #[allow(dead_code)] // used by the clean flow (Task 9)
     recipes: Vec<Recipe>,
-    #[allow(dead_code)] // used by the clean flow (Task 9)
     bin: Option<PathBuf>,
     threads: usize,
     scan_root: PathBuf,
@@ -162,6 +202,19 @@ pub struct App {
     /// Directories we came from (innermost last), with the selection to return to.
     stack: Vec<(PathBuf, usize)>,
     rx: Option<Receiver<Msg>>,
+    /// Clean flow: recipe results in recipe order, from the database refreshed for `root`.
+    picks: Vec<(usize, Result<Selection, String>)>,
+    /// Menu cursor, an index into [`App::shown`].
+    msel: usize,
+    /// The chosen entry of `picks`, and which of its hits are ticked.
+    pick: usize,
+    ticks: Vec<bool>,
+    psel: usize,
+    poff: usize,
+    cancel: Arc<AtomicBool>,
+    /// Running: (done, total, last path).
+    step: (usize, usize, String),
+    outcome: Option<Outcome>,
 }
 
 impl App {
@@ -190,6 +243,15 @@ impl App {
             offset: 0,
             stack: Vec::new(),
             rx: None,
+            picks: Vec::new(),
+            msel: 0,
+            pick: 0,
+            ticks: Vec::new(),
+            psel: 0,
+            poff: 0,
+            cancel: Arc::default(),
+            step: (0, 0, String::new()),
+            outcome: None,
         }
     }
 
@@ -389,6 +451,229 @@ impl App {
         }
     }
 
+    /// A worker is showing progress, so the screen must keep redrawing.
+    pub fn busy(&self) -> bool {
+        match self.mode {
+            Mode::Refreshing | Mode::Running => true,
+            Mode::Menu => self.computing(),
+            _ => false,
+        }
+    }
+
+    fn computing(&self) -> bool {
+        self.rx.is_some() && self.picks.len() < self.recipes.len()
+    }
+
+    /// `c`: rescan `root`, then run every recipe on the refreshed database, in one worker,
+    /// so the hits can only come from a database refreshed for this directory just now.
+    fn start_clean(&mut self) {
+        self.progress = Arc::default();
+        self.scan_started = Instant::now();
+        self.picks.clear();
+        self.msel = 0;
+        self.mode = Mode::Refreshing;
+        let (db, here, threads, progress) = (
+            self.db_path.clone(),
+            self.root.clone(),
+            self.threads,
+            self.progress.clone(),
+        );
+        let recipes = self.recipes.clone();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = db::refresh(&db, std::slice::from_ref(&here), threads, progress);
+            let ok = res.is_ok() && is_dir(&here);
+            if tx.send(Msg::Refreshed(res)).is_err() || !ok {
+                return;
+            }
+            let d = match Db::open_ro(&db) {
+                Ok(d) => d,
+                Err(e) => {
+                    for i in 0..recipes.len() {
+                        let _ = tx.send(Msg::Picked(i, Err(e.to_string())));
+                    }
+                    return;
+                }
+            };
+            for (i, r) in recipes.iter().enumerate() {
+                // Stop once nobody listens (esc, or a run started).
+                if tx
+                    .send(Msg::Picked(i, recipe::select(&d, r, &here)))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn on_refreshed(&mut self, res: io::Result<db::Refreshed>) {
+        if self.mode != Mode::Refreshing {
+            // esc'd: apply the finished refresh silently.
+            self.rx = None;
+            self.reopen();
+            return;
+        }
+        let here = self.root.clone();
+        if !is_dir(&here) {
+            while !is_dir(&self.root) {
+                if let Some((r, sel)) = self.stack.pop() {
+                    (self.root, self.sel) = (r, sel);
+                } else if self.root != self.scan_root && self.root.pop() {
+                    self.sel = 0;
+                } else {
+                    break;
+                }
+            }
+            self.rx = None;
+            self.offset = 0;
+            self.mode = Mode::List;
+            self.reopen();
+            self.status = format!(
+                "{} no longer exists; showing the folder above.",
+                here.display()
+            );
+            return;
+        }
+        match res {
+            Ok(_) => {
+                self.reopen();
+                self.mode = Mode::Menu;
+            }
+            Err(e) => {
+                self.rx = None;
+                self.mode = Mode::List;
+                self.status = format!("Could not update the scan of this folder: {e}");
+            }
+        }
+    }
+
+    /// Indexes into `picks` of the recipes that can be chosen: those that found something.
+    fn shown(&self) -> Vec<usize> {
+        (0..self.picks.len())
+            .filter(|&i| self.picks[i].1.as_ref().is_ok_and(|s| !s.hits.is_empty()))
+            .collect()
+    }
+
+    /// The chosen recipe and its selection (Paths, Confirm).
+    fn chosen(&self) -> (&Recipe, &Selection) {
+        let (i, sel) = &self.picks[self.pick];
+        (
+            &self.recipes[*i],
+            sel.as_ref().expect("only successful picks are chosen"),
+        )
+    }
+
+    fn ticked_size(&self) -> (usize, u64) {
+        let (_, sel) = self.chosen();
+        sel.hits
+            .iter()
+            .zip(&self.ticks)
+            .filter(|(_, t)| **t)
+            .fold((0, 0), |(n, s), (h, _)| (n + 1, s + h.size))
+    }
+
+    fn on_key_menu(&mut self, code: KeyCode) {
+        let shown = self.shown();
+        if let Some(n) = Self::step(self.msel, shown.len(), code) {
+            self.msel = n;
+            return;
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.rx = None;
+                self.mode = Mode::List;
+            }
+            KeyCode::Enter => {
+                let Some(&i) = shown.get(self.msel) else {
+                    return;
+                };
+                let Ok(sel) = &self.picks[i].1 else { return };
+                self.ticks = vec![true; sel.hits.len()];
+                (self.pick, self.psel, self.poff) = (i, 0, 0);
+                self.mode = Mode::Paths;
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_paths(&mut self, key: KeyEvent) {
+        let len = self.ticks.len();
+        if let Some(n) = Self::step(self.psel, len, key.code) {
+            self.psel = n;
+            return;
+        }
+        match key.code {
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let all = !self.ticks.iter().all(|&t| t);
+                self.ticks.fill(all);
+            }
+            KeyCode::Char(' ') => {
+                if let Some(t) = self.ticks.get_mut(self.psel) {
+                    *t = !*t;
+                }
+                self.psel = (self.psel + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Enter if self.ticked_size().0 == 0 => {
+                self.status = "Tick at least one path to continue.".into();
+            }
+            KeyCode::Enter => self.mode = Mode::Confirm,
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Menu,
+            _ => {}
+        }
+    }
+
+    fn start_run(&mut self) {
+        let (r, sel) = self.chosen();
+        let recipe = r.clone();
+        // Only the ticked hits, in order: `apply::run` is what keeps them inside `here`.
+        let hits: Vec<_> = sel
+            .hits
+            .iter()
+            .zip(&self.ticks)
+            .filter(|(_, t)| **t)
+            .map(|(h, _)| h.clone())
+            .collect();
+        self.cancel = Arc::default();
+        self.step = (0, hits.len(), String::new());
+        self.outcome = None;
+        self.mode = Mode::Running;
+        let (db, root, here, bin, threads) = (
+            self.db_path.clone(),
+            self.scan_root.clone(),
+            self.root.clone(),
+            self.bin.clone(),
+            self.threads,
+        );
+        let cancel = self.cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        std::thread::spawn(move || {
+            let total = hits.len();
+            let (mut done, mut problems) = (0, Vec::new());
+            apply::run(
+                &recipe,
+                &root,
+                &here,
+                &hits,
+                bin.as_deref(),
+                &cancel,
+                &mut |i, h, v| {
+                    if *v == Verdict::Done {
+                        done += 1;
+                    } else {
+                        problems.push((h.path.clone(), v.clone()));
+                    }
+                    let p = String::from_utf8_lossy(&h.path).into_owned();
+                    let _ = tx.send(Msg::Step(i + 1, total, p));
+                },
+            );
+            let res = db::refresh(&db, &[here], threads, Arc::default());
+            let _ = tx.send(Msg::Applied(done, problems, res));
+        });
+    }
+
     fn step(cur: usize, len: usize, key: KeyCode) -> Option<usize> {
         let last = len.saturating_sub(1);
         Some(match key {
@@ -429,17 +714,39 @@ impl App {
                     KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h' | 'u') => self.go_up(),
                     KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                     KeyCode::Char('N') => self.want_ncdu = true,
+                    KeyCode::Char('c') if self.db.is_some() => self.start_clean(),
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_dir(),
                     _ => {}
                 }
             }
-            Mode::Confirm => {
-                if matches!(code, KeyCode::Esc | KeyCode::Char('n' | 'q')) {
+            Mode::Refreshing => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+                    // The scan can't be interrupted; its result is applied when it ends.
                     self.mode = Mode::List;
                 }
             }
-            Mode::Running => {}
-            Mode::Done => self.mode = Mode::List,
+            Mode::Menu => {
+                self.status.clear();
+                self.on_key_menu(code);
+            }
+            Mode::Paths => {
+                self.status.clear();
+                self.on_key_paths(key);
+            }
+            Mode::Confirm => match code {
+                KeyCode::Char('y' | 'Y') => self.start_run(),
+                KeyCode::Esc | KeyCode::Char('n' | 'q') => self.mode = Mode::Paths,
+                _ => {}
+            },
+            Mode::Running => {
+                if code == KeyCode::Esc && !self.cancel.swap(true, Ordering::Relaxed) {
+                    self.status = "Stopping after the current path…".into();
+                }
+            }
+            Mode::Done => {
+                self.status.clear();
+                self.mode = Mode::List;
+            }
         }
     }
 
@@ -462,6 +769,23 @@ impl App {
                             self.mode = Mode::Ask;
                         }
                     }
+                }
+                Msg::Refreshed(res) => self.on_refreshed(res),
+                Msg::Picked(i, res) => self.picks.push((i, res)),
+                Msg::Step(done, total, path) => self.step = (done, total, path),
+                Msg::Applied(done, problems, res) => {
+                    self.rx = None;
+                    let before = self.total;
+                    self.reopen();
+                    self.status.clear();
+                    self.outcome = Some(Outcome {
+                        done,
+                        problems,
+                        rescan: res.err().map(|e| e.to_string()),
+                        before,
+                        after: self.total,
+                    });
+                    self.mode = Mode::Done;
                 }
             }
         }
@@ -486,10 +810,15 @@ impl App {
         let help = match self.mode {
             Mode::Ask => "answer with the keys shown · q quit",
             Mode::Scanning => "scanning — q quits and discards this scan",
-            Mode::List => "↑↓/jk move · enter open dir · backspace up · N ncdu · q quit",
-            Mode::Confirm => "n/esc cancel",
-            Mode::Running => "running — please wait",
-            Mode::Done => "press any key",
+            Mode::List => "↑↓ move · enter open · ← back · c clean this folder · N ncdu · q quit",
+            Mode::Refreshing => "esc back (the update finishes in the background)",
+            Mode::Menu => "↑↓ move · enter choose · esc back",
+            Mode::Paths => {
+                "↑↓ move · space tick/untick · ctrl-a all/none · enter continue · esc back"
+            }
+            Mode::Confirm => "y yes, clean · n/esc back",
+            Mode::Running => "esc stop after the current path",
+            Mode::Done => "any key back to the folder",
         };
         f.render_widget(
             Paragraph::new(vec![
@@ -502,8 +831,278 @@ impl App {
             Mode::Ask => self.draw_ask(f, body),
             Mode::Scanning => self.draw_scanning(f, body),
             Mode::List => self.draw_list(f, body),
-            Mode::Confirm | Mode::Running | Mode::Done => {}
+            Mode::Refreshing => self.draw_refreshing(f, body),
+            Mode::Menu => self.draw_menu(f, body),
+            Mode::Paths => self.draw_paths(f, body),
+            Mode::Confirm => self.draw_confirm(f, body),
+            Mode::Running => self.draw_running(f, body),
+            Mode::Done => self.draw_done(f, body),
         }
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPIN[(self.scan_started.elapsed().as_millis() / 150) as usize % SPIN.len()]
+    }
+
+    fn draw_refreshing(&self, f: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from(format!(
+                "{} Updating the scan of {} …",
+                self.spinner(),
+                self.root.display()
+            ))
+            .bold(),
+            Line::from(format!(
+                "{} of your files found · {}s",
+                self.progress.files.load(Ordering::Relaxed),
+                self.scan_started.elapsed().as_secs()
+            )),
+            Line::from("Then dume looks for what can be cleaned here."),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" Clean this folder ")),
+            area,
+        );
+    }
+
+    fn draw_menu(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::bordered().title(" What to clean here ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let [list, note] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        if self.computing() {
+            f.render_widget(
+                Line::from(format!(
+                    "{} Checking recipe {} of {} …",
+                    self.spinner(),
+                    self.picks.len() + 1,
+                    self.recipes.len()
+                )),
+                note,
+            );
+        }
+        // Failures are listed below the choices, one line each, and cannot be chosen.
+        let failed: Vec<Line> = self
+            .picks
+            .iter()
+            .filter_map(|(i, res)| res.as_ref().err().map(|e| (i, e)))
+            .map(|(i, e)| {
+                Line::from(format!("recipe {} failed: {e}", self.recipes[*i].name)).yellow()
+            })
+            .collect();
+        let shown = self.shown();
+        let [list, errs] = Layout::vertical([
+            Constraint::Length(shown.len().max(2) as u16),
+            Constraint::Min(0),
+        ])
+        .areas(list);
+        f.render_widget(Paragraph::new(failed).wrap(Wrap { trim: false }), errs);
+        if shown.is_empty() {
+            if !self.computing() {
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from("Nothing to clean here.").bold(),
+                        Line::from("Go back (esc) and try another folder, or a folder above."),
+                    ]),
+                    list,
+                );
+            }
+            return;
+        }
+        self.msel = self.msel.min(shown.len() - 1);
+        // shortcut: the menu is not windowed; there are only as many lines as recipes.
+        let rows: Vec<TRow> = shown
+            .iter()
+            .map(|&i| {
+                let r = &self.recipes[self.picks[i].0];
+                let s = self.picks[i].1.as_ref().expect("shown picks are Ok");
+                TRow::new([
+                    r.name.clone(),
+                    n_paths(s.hits.len()),
+                    amount(&r.apply, s.size),
+                ])
+            })
+            .collect();
+        let widths = [
+            Constraint::Min(20),
+            Constraint::Length(14),
+            Constraint::Length(16),
+        ];
+        f.render_stateful_widget(
+            Table::new(rows, widths)
+                .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("▶ "),
+            list,
+            &mut TableState::default().with_selected(Some(self.msel)),
+        );
+    }
+
+    /// `p` (relative to the scan root) relative to `root`, for display.
+    fn rel_here(&self, p: &[u8]) -> String {
+        let here = self
+            .root
+            .strip_prefix(&self.scan_root)
+            .unwrap_or(Path::new(""));
+        let n = here.as_os_str().len();
+        let p = if n == 0 {
+            p
+        } else {
+            p.get(n + 1..).unwrap_or(p)
+        };
+        String::from_utf8_lossy(p).into_owned()
+    }
+
+    fn draw_paths(&mut self, f: &mut Frame, area: Rect) {
+        let (r, sel) = self.chosen();
+        let (n, size) = self.ticked_size();
+        let title = format!(
+            " {}: {n} of {} paths ticked, {} — in {} ",
+            r.name,
+            sel.hits.len(),
+            amount(&r.apply, size),
+            self.root.display()
+        );
+        let block = Block::bordered().title(title);
+        let inner = block.inner(area);
+        // Build only the rows on screen: a recipe can select hundreds of thousands of paths.
+        let height = inner.height as usize;
+        let off = window(self.poff, self.psel, height, sel.hits.len());
+        let end = (off + height).min(sel.hits.len());
+        let rows: Vec<TRow> = (off..end)
+            .map(|i| {
+                let h = &sel.hits[i];
+                let name = self.rel_here(&h.path);
+                TRow::new([
+                    if self.ticks[i] { "[x]" } else { "[ ]" }.to_string(),
+                    human(h.size),
+                    if h.is_dir { format!("{name}/") } else { name },
+                ])
+            })
+            .collect();
+        let widths = [
+            Constraint::Length(3),
+            Constraint::Length(11),
+            Constraint::Min(10),
+        ];
+        let sel_row = self.psel - off;
+        f.render_stateful_widget(
+            Table::new(rows, widths)
+                .block(block)
+                .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("▶ "),
+            area,
+            &mut TableState::default().with_selected(Some(sel_row)),
+        );
+        self.poff = off;
+    }
+
+    fn draw_confirm(&self, f: &mut Frame, area: Rect) {
+        let (r, _) = self.chosen();
+        let (n, size) = self.ticked_size();
+        let mut lines = vec![
+            Line::from(format!("In {}", self.root.display())).bold(),
+            Line::from(format!(
+                "clean with \"{}\": {} ({})",
+                r.name,
+                n_paths(n),
+                amount(&r.apply, size)
+            )),
+            Line::from(""),
+        ];
+        if self.root == self.scan_root {
+            lines.push(
+                Line::from(format!(
+                    "Careful: this is the WHOLE scan root, {}.",
+                    self.scan_root.display()
+                ))
+                .bold()
+                .red(),
+            );
+        }
+        lines.push(match &r.apply {
+            Apply::Delete => Line::from("This cannot be undone.").bold(),
+            Apply::Script(s) => Line::from(format!(
+                "Runs {} on each file.",
+                s.file_name().unwrap_or_default().to_string_lossy()
+            )),
+        });
+        lines.push(Line::from(""));
+        lines.push(Line::from("[y] yes, clean   [n] no, go back"));
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title(" Are you sure? ")),
+            area,
+        );
+    }
+
+    fn draw_running(&self, f: &mut Frame, area: Rect) {
+        let (done, total, path) = &self.step;
+        let lines = vec![
+            Line::from(format!("Cleaning: {done} of {total} paths")).bold(),
+            Line::from(path.as_str()),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" Cleaning ")),
+            area,
+        );
+    }
+
+    fn draw_done(&self, f: &mut Frame, area: Rect) {
+        let Some(o) = &self.outcome else { return };
+        let freed = o.before.saturating_sub(o.after);
+        let mut lines = vec![if freed > 0 {
+            Line::from(format!(
+                "Freed {} here (was {}, now {}).",
+                human(freed),
+                human(o.before),
+                human(o.after)
+            ))
+            .bold()
+        } else {
+            Line::from(format!(
+                "This folder did not shrink: still {}.",
+                human(o.after)
+            ))
+            .bold()
+        }];
+        let failed = o
+            .problems
+            .iter()
+            .filter(|(_, v)| matches!(v, Verdict::Failed(_)))
+            .count();
+        lines.push(Line::from(format!(
+            "{} done · {} skipped · {failed} failed",
+            o.done,
+            o.problems.len() - failed
+        )));
+        if let Some(e) = &o.rescan {
+            lines.push(Line::from(format!("Could not update the scan afterwards: {e}")).yellow());
+        }
+        // Only as many reasons as fit.
+        let room = (area.height as usize).saturating_sub(lines.len() + 3);
+        if !o.problems.is_empty() {
+            lines.push(Line::from(""));
+        }
+        for (p, v) in o.problems.iter().take(room) {
+            let (what, why) = match v {
+                Verdict::Failed(w) => ("failed", w),
+                Verdict::Skipped(w) => ("skipped", w),
+                Verdict::Done => continue,
+            };
+            lines.push(Line::from(format!("{what}: {}: {why}", self.rel_here(p))));
+        }
+        if o.problems.len() > room {
+            lines.push(Line::from(format!(
+                "… and {} more",
+                o.problems.len() - room
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" Done ")),
+            area,
+        );
     }
 
     fn draw_ask(&self, f: &mut Frame, area: Rect) {

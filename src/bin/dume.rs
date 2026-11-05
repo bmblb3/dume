@@ -90,7 +90,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         let mut redraw = true;
         while !app.quit {
             // Draw only when something changed (key, resize) or a background job is showing progress.
-            if redraw || matches!(app.mode, tui::Mode::Running | tui::Mode::Scanning) {
+            if redraw || app.busy() || app.mode == tui::Mode::Scanning {
                 term.draw(|f| app.draw(f))?;
             }
             redraw = false;
