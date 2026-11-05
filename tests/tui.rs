@@ -701,3 +701,50 @@ fn what_lists_dirs_and_files_with_a_filter() {
         "{s}"
     );
 }
+
+#[test]
+fn tab_selects_matches_and_only_those_are_cleaned() {
+    let e = env();
+    let mut a = app(&e);
+    key(&mut a, KeyCode::Tab);
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Matches);
+    assert!(screen(&mut a).contains("all will be used"));
+
+    // Tick the first and third match (tab ticks, then moves down).
+    key(&mut a, KeyCode::Tab);
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Tab);
+    let s = screen(&mut a);
+    assert!(s.contains("2 selected"), "{s}");
+
+    key(&mut a, KeyCode::Char('a'));
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Confirm);
+    assert!(screen(&mut a).contains("2 directories"));
+    key(&mut a, KeyCode::Char('y'));
+    wait_done(&mut a);
+    assert!(a.failed.is_empty(), "{:?}", a.failed);
+
+    let cleaned = (1..=3)
+        .filter(|i| !e.root.join(format!("proj/case_{i}/100")).exists())
+        .count();
+    assert_eq!(cleaned, 2, "exactly the ticked directories");
+    assert!(
+        e.root.join("proj/case_2/100").exists(),
+        "the unticked one is untouched"
+    );
+}
+
+#[test]
+fn ctrl_a_selects_all_then_none() {
+    let e = env();
+    let mut a = app(&e);
+    key(&mut a, KeyCode::Tab);
+    key(&mut a, KeyCode::Enter);
+    a.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(screen(&mut a).contains("3 selected"));
+    a.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(screen(&mut a).contains("all will be used"));
+    assert_eq!(a.mode, Mode::Matches, "ctrl-a is not the actions key");
+}

@@ -211,6 +211,8 @@ pub struct App {
     sel: [usize; 2],
     scroll: usize,
     act_sel: usize,
+    /// Matches ticked with tab; empty means every match.
+    marked: std::collections::BTreeSet<usize>,
     show_all: bool,
     /// Roots we came from (innermost last), with the report and selection to return to.
     /// The report is dropped after an action, since its sizes are then out of date.
@@ -264,6 +266,7 @@ impl App {
             show_all: false,
             stack: Vec::new(),
             offsets: [0; 3],
+            marked: Default::default(),
             doc: None,
             rx: None,
             total: 0,
@@ -611,6 +614,7 @@ impl App {
                     _ if open && self.cur_row().is_some() => {
                         self.mode = Mode::Matches;
                         self.scroll = 0;
+                        self.marked.clear();
                     }
                     _ if open && !self.what.is_empty() => {
                         self.status =
@@ -622,7 +626,19 @@ impl App {
             }
             Mode::Matches => {
                 let n = self.cur_row().map_or(0, |r| r.dirs.len());
-                if let Some(s) = Self::step(self.scroll, n, code) {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('a') {
+                    // fzf's select-all: toggles between everything and nothing.
+                    self.marked = if self.marked.len() == n {
+                        Default::default()
+                    } else {
+                        (0..n).collect()
+                    };
+                } else if matches!(code, KeyCode::Tab | KeyCode::Char(' ')) && n > 0 {
+                    if !self.marked.remove(&self.scroll) {
+                        self.marked.insert(self.scroll);
+                    }
+                    self.scroll = (self.scroll + 1).min(n - 1);
+                } else if let Some(s) = Self::step(self.scroll, n, code) {
                     self.scroll = s;
                 } else if back {
                     self.mode = Mode::List;
@@ -649,7 +665,7 @@ impl App {
                 }
             }
             Mode::Confirm => {
-                let n = self.cur_row().map_or(0, |r| r.dirs.len());
+                let n = self.cur_row().map_or(0, |r| self.target_count(r));
                 if let Some(s) = Self::step(self.scroll, n, code) {
                     self.scroll = s;
                 } else if code == KeyCode::Char('y') {
@@ -666,15 +682,31 @@ impl App {
         }
     }
 
+    /// The matches an action will run on: the ticked ones, or all when none are ticked.
+    fn targets<'a>(&'a self, row: &'a Row) -> Box<dyn Iterator<Item = &'a (String, u64)> + 'a> {
+        if self.marked.is_empty() {
+            Box::new(row.dirs.iter())
+        } else {
+            Box::new(self.marked.iter().filter_map(|&i| row.dirs.get(i)))
+        }
+    }
+
+    fn target_count(&self, row: &Row) -> usize {
+        if self.marked.is_empty() {
+            row.dirs.len()
+        } else {
+            self.marked.len()
+        }
+    }
+
     fn start(&mut self) {
         let list = self.action_list();
         let (Some(row), Some(&ai)) = (self.cur_row().cloned(), list.get(self.act_sel)) else {
             return;
         };
         let action = self.actions[ai].clone();
-        let dirs: Vec<PathBuf> = row
-            .dirs
-            .iter()
+        let dirs: Vec<PathBuf> = self
+            .targets(&row)
             .map(|(p, _)| self.root.join(p.trim_start_matches('/')))
             .collect();
         self.total = dirs.len();
@@ -683,7 +715,7 @@ impl App {
         self.before = self.report.total;
         self.after = None;
         self.refresh_err = None;
-        self.running = format!("{} on {}", action.name, row.pattern);
+        self.running = format!("{} on {} ({} dirs)", action.name, row.pattern, dirs.len());
         self.mode = Mode::Running;
 
         let (tx, rx) = mpsc::channel();
@@ -792,7 +824,9 @@ impl App {
             Mode::List => {
                 "↑↓/jk move · enter open pattern · d dirs · f files · backspace up · tab where · N ncdu · q quit"
             }
-            Mode::Matches => "↑↓/jk scroll · enter/a choose action · esc back",
+            Mode::Matches => {
+                "↑↓/jk move · tab/space select · ctrl-a all · enter/a choose action (none selected = all) · esc back"
+            }
             Mode::Actions => "↑↓/jk select · enter choose · A show all actions · esc back",
             Mode::Confirm => "y run · n/esc cancel · ↑↓ scroll",
             Mode::Running => "running — please wait",
@@ -998,15 +1032,28 @@ impl App {
         let end = (off + height).min(row.dirs.len());
         let rows: Vec<TRow> = row.dirs[off..end]
             .iter()
-            .map(|(p, s)| TRow::new([p.trim_start_matches('/').to_string(), human(*s)]))
+            .enumerate()
+            .map(|(i, (p, s))| {
+                let tick = if self.marked.contains(&(off + i)) {
+                    "✓"
+                } else {
+                    " "
+                };
+                TRow::new([format!("{tick} {}", p.trim_start_matches('/')), human(*s)])
+            })
             .collect();
         f.render_stateful_widget(
             Table::new(rows, [Constraint::Min(10), Constraint::Length(11)])
                 .block(Block::bordered().title(format!(
-                    " {} — {} dirs, {} ",
+                    " {} — {} dirs, {} · {} ",
                     row.pattern,
                     row.count,
-                    human(row.size)
+                    human(row.size),
+                    if self.marked.is_empty() {
+                        "all will be used".to_string()
+                    } else {
+                        format!("{} selected", self.marked.len())
+                    }
                 )))
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("▶ "),
@@ -1060,9 +1107,9 @@ impl App {
             Line::from(format!("Run `{}` ({})", a.name, a.path.display())).bold(),
             Line::from(format!(
                 "in each of {} directories matching `{}` ({}), with the directory as working dir.",
-                row.count,
+                self.target_count(row),
                 row.pattern,
-                human(row.size)
+                human(self.targets(row).map(|d| d.1).sum())
             )),
             Line::from("Changes are permanent. Press y to run, n to cancel.").red(),
             Line::from(""),
@@ -1072,8 +1119,7 @@ impl App {
         let skip = self.scroll.min(header.len());
         let mut lines: Vec<Line> = header.into_iter().skip(skip).collect();
         lines.extend(
-            row.dirs
-                .iter()
+            self.targets(row)
                 .skip(self.scroll.saturating_sub(4))
                 .take(height)
                 .map(|(p, s)| {

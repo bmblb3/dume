@@ -22,8 +22,8 @@ Two views, with the current directory always shown as a breadcrumb (`/team/root 
 1. **Where** (start here): the subdirectories of the current directory, biggest first, ncdu-style.
    `enter` goes into one, `backspace` (or `h`, `u`, `esc`) goes up.
 2. **What** (`tab`): the patterns that repeat inside the current directory, directories and files in one
-   list (`d` / `f` show only one kind). `enter` on a directory pattern lists its matches, `enter` again
-   picks a cleaning action, `y` confirms. Actions apply to directory patterns only.
+   list (`d` / `f` show only one kind). `enter` on a directory pattern lists its matches; `tab`/`space` tick
+   matches (`ctrl-a` all/none; nothing ticked = all), `enter` or `a` picks a cleaning action, `y` confirms. Actions apply to directory patterns only.
 
 Everything in *What* is computed for the directory you are in, so drill down in *Where* first to narrow it.
 `N` browses everything in ncdu, `q` quits.
