@@ -20,7 +20,7 @@ struct Cli {
     #[arg(short = 'j', long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..))]
     threads: u16,
     /// Owner uid to keep (default: your own uid)
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with_all = ["merge", "report", "json"])]
     uid: Option<u32>,
     /// Scan DIR into the database FILE instead of printing JSON
     #[arg(short, long, value_name = "FILE", conflicts_with_all = ["merge", "report", "json"])]
@@ -87,7 +87,7 @@ fn run(cli: &Cli) -> std::io::Result<()> {
     if let Some(file) = &cli.merge {
         let uid = db::Db::open_ro(file)?.meta()?.uid;
         let r = db::refresh(file, &[dir.canonicalize()?], cli.threads as usize, progress)?;
-        return summary(r.files, r.errors, uid);
+        return summary(r.files, r.errors, uid, false);
     }
     let uid = cli
         .uid
@@ -96,23 +96,24 @@ fn run(cli: &Cli) -> std::io::Result<()> {
     if let Some(file) = &cli.output {
         let n =
             db::scan_to_db(dir, file, uid, cli.threads as usize, progress.clone()).map_err(wrap)?;
-        return summary(n, progress_errors(&progress), uid);
+        return summary(n, progress_errors(&progress), uid, false);
     }
     let (scan, dev) = scan::scan(dir, uid, cli.threads as usize, cli.verbose).map_err(wrap)?;
     let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
     let root = dir.to_string_lossy();
     scan.write(&mut out, &root, dev, uid, env!("CARGO_PKG_VERSION"))?;
-    summary(scan.files, scan.errors, uid)
+    summary(scan.files, scan.errors, uid, true)
 }
 
 fn progress_errors(p: &scan::Progress) -> u64 {
     p.errors.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn summary(files: u64, errors: u64, uid: u32) -> std::io::Result<()> {
+fn summary(files: u64, errors: u64, uid: u32, hint: bool) -> std::io::Result<()> {
     eprintln!("dume-scan: {files} files for uid {uid}");
     if errors > 0 {
-        eprintln!("dume-scan: warning: {errors} entries could not be read (use -v to list)");
+        let h = if hint { " (use -v to list)" } else { "" };
+        eprintln!("dume-scan: warning: {errors} entries could not be read{h}");
     }
     Ok(())
 }

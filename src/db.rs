@@ -181,7 +181,8 @@ impl Db {
                 |_| Ok(()),
             )
             .is_ok();
-        if !found {
+        // A scan with no kept files has no root row: the root is just empty.
+        if !found && !rel.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} is not in the database", here.display()),
@@ -283,6 +284,18 @@ pub fn scan_to_db(
     })
 }
 
+fn json_name(v: &serde_json::Value) -> io::Result<Vec<u8>> {
+    v["name"]
+        .as_str()
+        .map(|s| s.as_bytes().to_vec())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "export entry has no string name",
+            )
+        })
+}
+
 /// Convert an old `dume.json` export into a database at `db` (mtime NULL).
 /// Returns the number of files.
 pub fn import_json(json: &Path, db: &Path) -> io::Result<u64> {
@@ -294,11 +307,7 @@ pub fn import_json(json: &Path, db: &Path) -> io::Result<u64> {
     let mut stack = vec![(None, ex.subtree(&[])?)];
     while let Some((parent, d)) = stack.pop() {
         let id = dirs.len();
-        let name = d[0]["name"]
-            .as_str()
-            .unwrap_or_default()
-            .as_bytes()
-            .to_vec();
+        let name = json_name(&d[0])?;
         let mut recs = Vec::new();
         for item in &d[1..] {
             if item.is_array() {
@@ -306,11 +315,7 @@ pub fn import_json(json: &Path, db: &Path) -> io::Result<u64> {
             }
             let n = |k| item[k].as_u64().unwrap_or(0);
             recs.push(FileRec {
-                name: item["name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .as_bytes()
-                    .to_vec(),
+                name: json_name(item)?,
                 asize: n("asize"),
                 dsize: n("dsize"),
                 ino: n("ino"),

@@ -698,3 +698,60 @@ fn stdout_mode_unchanged_and_terminal_refused() {
     assert!(s.contains("refusing to write JSON to a terminal"), "{s}");
     assert!(s.contains("EXIT=2"), "{s}");
 }
+
+#[test]
+fn empty_database_gives_empty_json_and_report() {
+    let t = tempfile::tempdir().unwrap();
+    fs::create_dir(t.path().join("sub")).unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("x.db");
+    export(t.path(), &f);
+    let v = db_json(&f);
+    assert_eq!(v[3].as_array().unwrap().len(), 1);
+    assert_eq!(v[3][0]["name"], t.path().to_str().unwrap());
+    if ncdu_or_skip() {
+        let j = d.path().join("e.json");
+        fs::write(&j, run(&["--json", f.to_str().unwrap()]).1).unwrap();
+        let o = Command::new("ncdu")
+            .arg("-f")
+            .arg(&j)
+            .args(["-o", "/dev/null"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let (c, _, e) = report(t.path(), &f, &[]);
+    assert_eq!(c, 0, "{e}");
+    // a missing non-root path is still an error
+    assert_eq!(report(&t.path().join("sub"), &f, &[]).0, 1);
+
+    // importing an empty export reads back the same way
+    let j = d.path().join("old.json");
+    fs::write(&j, run(&[t.path().to_str().unwrap()]).1).unwrap();
+    let g = d.path().join("y.db");
+    assert_eq!(dumelib::db::import_json(&j, &g).unwrap(), 0);
+    assert_eq!(db_json(&g)[3].as_array().unwrap().len(), 1);
+    assert_eq!(report(t.path(), &g, &[]).0, 0);
+}
+
+#[test]
+fn import_rejects_missing_names_and_uid_conflicts() {
+    let d = tempfile::tempdir().unwrap();
+    let j = d.path().join("bad.json");
+    fs::write(
+        &j,
+        r#"[1,2,{"progname":"dume","uid":1},[{"name":"/r"},{"asize":1,"dsize":1,"ino":1}]]"#,
+    )
+    .unwrap();
+    let e = dumelib::db::import_json(&j, &d.path().join("x.db")).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(e.to_string().contains("name"), "{e}");
+    let f = d.path().join("x.db");
+    for flag in ["-m", "-r", "--json"] {
+        let mut a = vec!["/tmp", "-u", "1", flag, f.to_str().unwrap()];
+        if flag == "--json" {
+            a.remove(0);
+        }
+        assert_eq!(run(&a).0, 2, "{flag}");
+    }
+}
