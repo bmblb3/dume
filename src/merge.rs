@@ -141,7 +141,7 @@ pub fn scan_to_file(
     progress: std::sync::Arc<scan::Progress>,
 ) -> io::Result<u64> {
     use std::os::unix::fs::OpenOptionsExt;
-    let (s, dev) = scan::scan_progress(root, uid, threads, false, progress)?;
+    let (s, dev) = scan::scan_progress(root, uid, threads, false, progress, false)?;
     let name = export
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
