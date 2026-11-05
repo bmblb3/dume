@@ -20,6 +20,8 @@ browse it / rescan everything?"* Your scan is a SQLite database, `~/.local/state
 
 **Where** is the main view: the subdirectories of the current directory, biggest first, ncdu-style.
 `enter` goes into one, `backspace` (or `h`, `u`, `esc`) goes up, `q` quits.
+`x` removes the highlighted file or folder: dume rescans it first, shows how much that is, and asks; `y`
+removes it (files of other people inside are left alone), `n` or `esc` cancels.
 
 Press `c` to clean the **current folder** (so go into your case or project folder first):
 
