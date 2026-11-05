@@ -186,14 +186,16 @@ pub fn delete(c: &Checked, fix: &dyn Fn(&OsStr, &mut Stat)) -> Verdict {
         return fail(e);
     }
     if !kept.mounts.is_empty() {
-        let names: Vec<_> = kept
+        // Sorted: directory order differs between filesystems, the message must not.
+        let mut names: Vec<_> = kept
             .mounts
             .iter()
             .map(|m| m.display().to_string())
             .collect();
+        names.sort();
         return Verdict::Failed(format!("contains a mount point: {}", names.join(", ")));
     }
-    if let Some(first) = kept.theirs.first() {
+    if let Some(first) = kept.theirs.iter().min() {
         return Verdict::Failed(format!(
             "contains files owned by other people: {}",
             first.display()
