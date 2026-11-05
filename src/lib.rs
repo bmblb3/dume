@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod config;
+pub mod db;
 pub mod json;
 pub mod layout;
 pub mod merge;
