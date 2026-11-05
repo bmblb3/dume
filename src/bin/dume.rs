@@ -1,8 +1,9 @@
 use clap::Parser;
-use dumelib::{actions, config, layout, tui};
+use dumelib::{config, layout, recipe, tui};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
@@ -17,8 +18,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Cli {
     /// Directory inside the team root to look at [default: the current directory, if inside it]
     dir: Option<PathBuf>,
-    /// Where your scan is kept [default: ~/.local/state/dume/dume.json]
-    #[arg(short, long, env = "DUME_JSON")]
+    /// Where your scan database is kept [default: ~/.local/state/dume/dume.db]
+    #[arg(short, long, env = "DUME_DB")]
     file: Option<PathBuf>,
 }
 
@@ -41,12 +42,12 @@ fn run(cli: &Cli) -> Result<(), String> {
     let layout = layout::locate()?;
     let cfg = config::load(&layout)?;
     let env = |k: &str| std::env::var_os(k);
-    let export = match &cli.file {
+    let db = match &cli.file {
         Some(f) => f.clone(),
-        None => config::export_path(env)?,
+        None => config::db_path(env)?,
     };
-    let (actions, skipped) =
-        actions::load(&layout.share.join("actions")).map_err(|e| e.to_string())?;
+    let (recipes, skipped) =
+        recipe::load(&layout.share.join("actions")).map_err(|e| e.to_string())?;
 
     let view = match &cli.dir {
         Some(d) => {
@@ -72,16 +73,16 @@ fn run(cli: &Cli) -> Result<(), String> {
     let mut app = tui::App::launch(tui::Launch {
         view,
         scan_root: cfg.root.clone(),
-        export,
+        db: db.clone(),
         legacy_export: config::legacy_export(env),
-        actions,
+        recipes,
         bin: Some(layout.bin.clone()),
         threads: cfg.threads,
         stale_days: cfg.stale_days,
         uid: rustix::process::getuid().as_raw(),
     });
     if !skipped.is_empty() {
-        app.status = format!("skipped unsafe actions: {}", skipped.join("; "));
+        app.status = format!("skipped recipes: {}", skipped.join("; "));
     }
 
     let mut term = ratatui::init();
@@ -107,16 +108,12 @@ fn run(cli: &Cli) -> Result<(), String> {
             app.tick();
             redraw |= app.mode != before;
             if std::mem::take(&mut app.want_ncdu) {
+                let json = db.with_file_name("dume.ncdu.json");
                 ratatui::restore();
-                let ncdu = layout.bin.join("ncdu");
-                let ncdu = if ncdu.exists() {
-                    ncdu
-                } else {
-                    PathBuf::from("ncdu")
-                };
-                let status = Command::new(ncdu).arg("-f").arg(app.export_path()).status();
+                let res = ncdu(&app, &layout.bin, &json);
+                let _ = std::fs::remove_file(&json);
                 term = ratatui::init();
-                if let Err(e) = status {
+                if let Err(e) = res {
                     app.status = format!("could not run ncdu: {e}");
                 }
             }
@@ -126,4 +123,26 @@ fn run(cli: &Cli) -> Result<(), String> {
     ratatui::restore();
     app.cleanup();
     res.map_err(|e| e.to_string())
+}
+
+/// Write the database as an ncdu export to the private file `json`, then run ncdu on it.
+fn ncdu(app: &tui::App, bin: &Path, json: &Path) -> std::io::Result<()> {
+    let db = app
+        .db()
+        .ok_or_else(|| std::io::Error::other("no scan to show"))?;
+    let _ = std::fs::remove_file(json);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(json)?;
+    db.write_json(&mut std::io::BufWriter::new(f))?;
+    let ncdu = bin.join("ncdu");
+    let ncdu = if ncdu.exists() {
+        ncdu
+    } else {
+        PathBuf::from("ncdu")
+    };
+    Command::new(ncdu).arg("-f").arg(json).status()?;
+    Ok(())
 }

@@ -1,4 +1,4 @@
-//! Team-wide settings (`PREFIX/share/dume/config.toml`) and where each user's export lives.
+//! Team-wide settings (`PREFIX/share/dume/config.toml`) and where each user's scan lives.
 
 use crate::layout::{self, Layout};
 use serde::Deserialize;
@@ -64,18 +64,33 @@ pub fn load(layout: &Layout) -> Result<Config, String> {
     Ok(cfg)
 }
 
-/// The user's export: `$DUME_JSON`, else `$XDG_STATE_HOME/dume/dume.json`
-/// (default `~/.local/state/dume/dume.json`).
-pub fn export_path(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
-    if let Some(f) = env("DUME_JSON") {
+/// `$<var>`, else `$XDG_STATE_HOME/dume/<name>` (default `~/.local/state/dume/<name>`).
+fn state_file(
+    env: impl Fn(&str) -> Option<OsString>,
+    var: &str,
+    name: &str,
+) -> Result<PathBuf, String> {
+    if let Some(f) = env(var) {
         return Ok(f.into());
     }
     let state = env("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute()) // the XDG spec says to ignore relative values
         .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .ok_or("HOME is not set; set DUME_JSON to the export path")?;
-    Ok(state.join("dume/dume.json"))
+        .ok_or_else(|| format!("HOME is not set; set {var} to the {name} path"))?;
+    Ok(state.join("dume").join(name))
+}
+
+/// The user's export: `$DUME_JSON`, else `$XDG_STATE_HOME/dume/dume.json`
+/// (default `~/.local/state/dume/dume.json`).
+pub fn export_path(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
+    state_file(env, "DUME_JSON", "dume.json")
+}
+
+/// The user's scan database: `$DUME_DB`, else `$XDG_STATE_HOME/dume/dume.db`
+/// (default `~/.local/state/dume/dume.db`).
+pub fn db_path(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
+    state_file(env, "DUME_DB", "dume.db")
 }
 
 /// Where earlier versions kept the export.
@@ -137,6 +152,24 @@ mod tests {
             legacy_export(env(&[("HOME", "/h")])),
             Some("/h/dume.json".into())
         );
+    }
+
+    #[test]
+    fn db_locations() {
+        let p = |e| db_path(e).unwrap();
+        assert_eq!(
+            p(env(&[("HOME", "/h")])),
+            PathBuf::from("/h/.local/state/dume/dume.db")
+        );
+        assert_eq!(
+            p(env(&[("HOME", "/h"), ("XDG_STATE_HOME", "/s")])),
+            PathBuf::from("/s/dume/dume.db")
+        );
+        assert_eq!(
+            p(env(&[("HOME", "/h"), ("DUME_DB", "/f.db")])),
+            PathBuf::from("/f.db")
+        );
+        assert!(db_path(env(&[])).unwrap_err().contains("DUME_DB"));
     }
 
     #[test]
