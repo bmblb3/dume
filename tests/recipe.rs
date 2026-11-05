@@ -231,3 +231,65 @@ fn non_utf8_name_is_selected_exactly() {
     assert_eq!(paths(&s), [b"d/caf\xe9".as_slice()]);
     assert!(s.size > 0);
 }
+
+#[test]
+fn shipped_examples_parse() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("actions");
+    std::fs::create_dir(&dir).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/share/dume/actions.example");
+    let mode =
+        |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(&dir, 0o755);
+    for e in std::fs::read_dir(src).unwrap() {
+        let p = e.unwrap().path();
+        let to = dir.join(p.file_name().unwrap());
+        std::fs::copy(&p, &to).unwrap();
+        mode(
+            &to,
+            if p.extension().unwrap() == "sql" {
+                0o644
+            } else {
+                0o755
+            },
+        );
+    }
+    let (rs, skipped) = dumelib::recipe::load(&dir).unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(rs.len(), 3, "{rs:?}");
+
+    let foam = rs.iter().find(|r| r.name.starts_with("OpenFOAM")).unwrap();
+    let (_t, root, db) = foam_small();
+    let s = select(&db, foam, &root).unwrap();
+    let got: std::collections::BTreeSet<_> = paths(&s)
+        .iter()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    let want: std::collections::BTreeSet<String> =
+        ["0", "100", "processor0", "constant/polyMesh", "core.123"]
+            .map(String::from)
+            .into();
+    assert_eq!(got, want);
+}
+
+fn foam_small() -> (tempfile::TempDir, PathBuf, Db) {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("r");
+    for f in [
+        "0/U",
+        "100/U",
+        "processor0/0/U",
+        "constant/polyMesh/points",
+        "constant/transportProperties",
+        "core.123",
+        "system/controlDict",
+    ] {
+        put(&root.join(f), 5000);
+    }
+    let dbp = t.path().join("x.db");
+    let uid = rustix::process::getuid().as_raw();
+    scan_to_db(&root, &dbp, uid, 1, Default::default()).unwrap();
+    let db = Db::open_ro(&dbp).unwrap();
+    (t, root, db)
+}

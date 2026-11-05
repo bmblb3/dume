@@ -1,6 +1,5 @@
 //! Shared code for the `dume` and `dumecl` binaries.
 
-pub mod actions;
 pub mod apply;
 pub mod config;
 pub mod db;

@@ -38,6 +38,8 @@ jobs:
           "$bin" --version
           "target/$TARGET/release/dume-scan" --version
           "target/$TARGET/release/dume-scan" . | ncdu -f- -o /dev/null
+          "target/$TARGET/release/dume-scan" . -o "$RUNNER_TEMP/s.db"
+          "target/$TARGET/release/dume-scan" --json "$RUNNER_TEMP/s.db" | ncdu -f- -o /dev/null
       - name: Package
         run: |
           name="dume-${GITHUB_REF_NAME}-${TARGET}"
