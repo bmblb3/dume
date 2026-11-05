@@ -424,7 +424,7 @@ fn menu(a: &mut App) -> String {
     key(a, KeyCode::Char('c'));
     assert_eq!(a.mode, Mode::Refreshing);
     let s = settle(a);
-    assert_eq!(a.mode, Mode::Menu, "{s}");
+    assert_eq!(a.mode, Mode::Menu, "status: {}\n{s}", a.status);
     s
 }
 
@@ -680,6 +680,13 @@ fn esc_during_refresh_cancels_and_keeps_db() {
         a.status
     );
     drop(lock);
+    // A child forked meanwhile by another test thread can hold a copy of the lock's fd until
+    // it execs; wait until the lock is really free.
+    let t = Instant::now();
+    while db::lock_writer(&e.db).is_err() {
+        assert!(t.elapsed() < Duration::from_secs(20), "lock never released");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     menu(&mut a);
 }
 
@@ -799,7 +806,9 @@ fn slow(n: u64) -> String {
 #[test]
 fn cannot_start_a_clean_while_recipes_are_still_being_checked() {
     let e = env();
-    let sl = slow(3_000_000);
+    // About 5 s unoptimised here; the menu shows "Time steps" within milliseconds of it starting,
+    // and recipe results only change inside `tick`, so `busy()` below is exact.
+    let sl = slow(6_000_000);
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG, ("slow.sql", &sl)]));
     key(&mut a, KeyCode::Char('c'));
     // Wait for the first recipe while the slow one is still running.
@@ -863,13 +872,21 @@ fn failed_rescan_after_clean_says_it_could_not_measure() {
 #[test]
 fn esc_stops_the_run_and_says_what_was_not_touched() {
     let e = env();
+    let base = e.root.parent().unwrap().to_path_buf();
+    let (started, gate) = (base.join("started"), base.join("gate"));
+    // Each run says it started, then waits until the test opens the gate.
+    let sh = format!(
+        "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
+        started.display(),
+        gate.display()
+    );
     let r = recipes(
         &e,
         &[
-            ("nap.sh", "#!/bin/sh\nsleep 0.3\n"),
+            ("gate.sh", &sh),
             (
                 "s.sql",
-                "-- dume-name: Nap\n-- dume-apply: nap.sh\nSELECT path FROM entries WHERE name REGEXP '^big$'",
+                "-- dume-name: Gate\n-- dume-apply: gate.sh\nSELECT path FROM entries WHERE name REGEXP '^big$'",
             ),
         ],
     );
@@ -878,18 +895,26 @@ fn esc_stops_the_run_and_says_what_was_not_touched() {
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Char('y'));
-    // Stop while the second script naps: two ran, four were never started.
+    // The first path is running (held at the gate) when esc is pressed.
     let t = Instant::now();
-    while !screen(&mut a).contains("Cleaning: 1 of 6") {
-        assert!(t.elapsed() < Duration::from_secs(20), "run never started");
-        a.tick();
+    while !started.exists() {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "first script never ran"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     key(&mut a, KeyCode::Esc);
+    fs::write(&gate, "").unwrap();
     let s = settle(&mut a);
     assert_eq!(a.mode, Mode::Done, "{s}");
     assert!(
-        s.contains("You stopped the run: 4 paths were not touched."),
+        s.contains("You stopped the run: 5 paths were not touched."),
         "{s}"
+    );
+    assert!(s.contains("1 done · 5 skipped"), "{s}");
+    assert!(
+        pos(&s, "You stopped the run") < pos(&s, "did not shrink"),
+        "headline first: {s}"
     );
 }

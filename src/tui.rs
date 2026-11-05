@@ -1100,6 +1100,17 @@ impl App {
             .iter()
             .filter(|(_, v)| matches!(v, Verdict::Skipped(w) if w == "cancelled"))
             .count();
+        if stopped > 0 {
+            lines.insert(
+                0,
+                Line::from(format!(
+                    "You stopped the run: {} {} not touched.",
+                    n_paths(stopped),
+                    if stopped == 1 { "was" } else { "were" }
+                ))
+                .bold(),
+            );
+        }
         let failed = o
             .problems
             .iter()
@@ -1110,16 +1121,6 @@ impl App {
             o.done,
             o.problems.len() - failed
         )));
-        if stopped > 0 {
-            lines.push(
-                Line::from(format!(
-                    "You stopped the run: {} {} not touched.",
-                    n_paths(stopped),
-                    if stopped == 1 { "was" } else { "were" }
-                ))
-                .bold(),
-            );
-        }
         // Only as many reasons as fit.
         let room = (area.height as usize).saturating_sub(lines.len() + 3);
         if !o.problems.is_empty() {
