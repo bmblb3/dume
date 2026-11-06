@@ -7,4 +7,12 @@ root = "/path/to/shared/root"
 # threads = 32      # concurrent stats per scan; lower it if many people scan at once
 # stale_days = 7    # warn when a user's scan is older than this
 # rescan_skip_secs = 300  # c skips rescanning a folder refreshed this recently; 0 = always rescan
-# prune = [".git", ".venv", ".direnv", "processor[0-9]*", "dynamicCode"]  # sized, not indexed; full rescan to apply
+# Sized but not indexed: browsing cannot enter them and recipes cannot see inside. Applies at the
+# next full rescan (r).
+# prune = [
+#   ".git", ".svn", ".hg",
+#   ".venv", "venv", "env", ".direnv", ".conda", "site-packages",
+#   "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".ipynb_checkpoints", ".cache",
+#   "node_modules", "build", "dist", "target",
+#   "processor[0-9]*", "dynamicCode",
+# ]
