@@ -1159,61 +1159,60 @@ impl App {
         let block = Block::bordered().title(" What to clean here ");
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let [list, note] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-        if self.computing() {
-            f.render_widget(
-                Line::from(format!(
-                    "{} Checking recipe {} of {} …",
-                    self.spinner(),
-                    self.picks.len() + 1,
-                    self.recipes.len()
-                )),
-                note,
-            );
-        }
-        // Failures are listed below the choices, one line each, and cannot be chosen.
-        let failed: Vec<Line> = self
-            .picks
-            .iter()
-            .filter_map(|(i, res)| res.as_ref().err().map(|e| (i, e)))
-            .map(|(i, e)| {
-                Line::from(format!("recipe {} failed: {e}", self.recipes[*i].name)).yellow()
-            })
-            .collect();
+        let list = inner;
+        // One row per recipe, in order, with how far its check is; only rows that found
+        // something can be chosen, and the cursor skips the rest.
         let shown = self.shown();
-        let [list, errs] = Layout::vertical([
-            Constraint::Length(shown.len().max(2) as u16),
-            Constraint::Min(0),
-        ])
-        .areas(list);
-        f.render_widget(Paragraph::new(failed).wrap(Wrap { trim: false }), errs);
-        if shown.is_empty() {
-            if !self.computing() {
-                f.render_widget(
-                    Paragraph::new(vec![
-                        Line::from("Nothing to clean here.").bold(),
-                        Line::from("Go back (esc) and try another folder, or a folder above."),
-                    ]),
-                    list,
-                );
-            }
-            return;
-        }
-        self.msel = self.msel.min(shown.len() - 1);
-        // shortcut: the menu is not windowed; there are only as many lines as recipes.
-        let rows: Vec<TRow> = shown
+        let busy = self.computing();
+        let spin = self.spinner();
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let rows: Vec<TRow> = self
+            .recipes
             .iter()
-            .map(|&i| {
-                let r = &self.recipes[self.picks[i].0];
-                let s = self.picks[i].1.as_ref().expect("shown picks are Ok");
-                TRow::new([
+            .enumerate()
+            .map(|(k, r)| match self.picks.get(k) {
+                Some((_, Ok(s))) if !s.hits.is_empty() => TRow::new([
                     r.name.clone(),
                     n_paths(s.hits.len()),
                     amount(&r.apply, s.size),
-                ])
+                ]),
+                Some((_, Ok(_))) => {
+                    TRow::new([r.name.clone(), "none found".into(), String::new()]).style(dim)
+                }
+                Some((_, Err(_))) => {
+                    TRow::new([r.name.clone(), "failed".into(), String::new()]).yellow()
+                }
+                None if busy && k == self.picks.len() => {
+                    TRow::new([r.name.clone(), format!("{spin} looking…"), String::new()])
+                }
+                None if busy => {
+                    TRow::new([r.name.clone(), "waiting".into(), String::new()]).style(dim)
+                }
+                None => TRow::new([r.name.clone(), "not checked".into(), String::new()]).style(dim),
             })
             .collect();
+        // Failures are spelled out below the rows, one line each, and cannot be chosen.
+        let mut notes: Vec<Line> = Vec::new();
+        if shown.is_empty() && !busy {
+            notes.push(Line::from("Nothing to clean here.").bold());
+            notes.push(Line::from(
+                "Go back (esc) and try another folder, or a folder above.",
+            ));
+        }
+        notes.extend(self.picks.iter().filter_map(|(i, res)| {
+            let e = res.as_ref().err()?;
+            Some(Line::from(format!("recipe {} failed: {e}", self.recipes[*i].name)).yellow())
+        }));
+        let [list, errs] = Layout::vertical([
+            Constraint::Length(rows.len().max(1) as u16),
+            Constraint::Min(0),
+        ])
+        .areas(list);
+        f.render_widget(Paragraph::new(notes).wrap(Wrap { trim: false }), errs);
+        self.msel = self.msel.min(shown.len().saturating_sub(1));
+        // The cursor row is the recipe's own row: picks arrive in recipe order.
+        let cursor = shown.get(self.msel).map(|&i| self.picks[i].0);
+        // shortcut: the menu is not windowed; there are only as many lines as recipes.
         let widths = [
             Constraint::Min(20),
             Constraint::Length(14),
@@ -1224,7 +1223,7 @@ impl App {
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("▶ "),
             list,
-            &mut TableState::default().with_selected(Some(self.msel)),
+            &mut TableState::default().with_selected(cursor),
         );
     }
 

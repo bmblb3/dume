@@ -477,11 +477,22 @@ fn c_rescans_then_shows_menu_with_counts() {
 }
 
 #[test]
-fn menu_hides_recipes_with_nothing_to_clean() {
+fn menu_lists_every_recipe_and_only_chooses_those_with_hits() {
     let e = env();
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG, NONE]));
     let s = menu(&mut a);
-    assert!(s.contains("Time steps") && !s.contains("Core dumps"), "{s}");
+    let row = |name: &str| {
+        s.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(row("Core dumps").contains("none found"), "{s}");
+    assert!(row("Time steps").contains("paths"), "{s}");
+    assert!(!s.contains("Nothing to clean here."), "{s}");
+    // Enter chooses the recipe with hits, not the first row.
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Paths);
 
     let mut a = app_with(&e, "proj", recipes(&e, &[NONE]));
     let s = menu(&mut a);
