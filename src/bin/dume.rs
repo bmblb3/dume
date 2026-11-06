@@ -106,9 +106,11 @@ fn run(cli: &Cli) -> Result<(), String> {
                     _ => {}
                 }
             }
-            let before = app.mode;
+            let (before, was_busy) = (app.mode, app.busy());
             app.tick();
-            redraw |= app.mode != before;
+            // The last message of a job ends `busy()` without changing the mode (the final
+            // recipe result): draw that last state, or it stays hidden until a key press.
+            redraw |= app.mode != before || (was_busy && !app.busy());
             if std::mem::take(&mut app.want_ncdu) {
                 let json = db.with_file_name(format!("dume.ncdu.{}.json", std::process::id()));
                 ratatui::restore();
