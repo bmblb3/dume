@@ -91,6 +91,7 @@ STAR-CCM+ and ANSA examples are placeholders that fail until you fill in the `TO
 | `root` | required | absolute path everyone scans |
 | `threads` | 32 | concurrent stats per scan; lower it if many people scan at once |
 | `stale_days` | 7 | warn when a scan is older |
+| `rescan_skip_secs` | 300 | `c` skips the rescan of a folder (re)scanned this recently in the session; 0 = always rescan |
 
 Unknown keys are errors.
 

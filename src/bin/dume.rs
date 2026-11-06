@@ -79,6 +79,7 @@ fn run(cli: &Cli) -> Result<(), String> {
         bin: Some(layout.bin.clone()),
         threads: cfg.threads,
         stale_days: cfg.stale_days,
+        rescan_skip_secs: cfg.rescan_skip_secs,
         uid: rustix::process::getuid().as_raw(),
     });
     if !skipped.is_empty() {

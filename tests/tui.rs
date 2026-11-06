@@ -68,6 +68,7 @@ fn launch_parts(e: &Env) -> tui::Launch {
         bin: None,
         threads: 2,
         stale_days: 7,
+        rescan_skip_secs: 300,
         uid: uid(),
     }
 }

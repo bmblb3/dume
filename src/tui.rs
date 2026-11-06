@@ -250,6 +250,7 @@ pub struct Launch {
     pub bin: Option<PathBuf>,
     pub threads: usize,
     pub stale_days: u64,
+    pub rescan_skip_secs: u64,
     pub uid: u32,
 }
 
@@ -271,6 +272,11 @@ pub struct App {
     uid: u32,
     legacy: Option<PathBuf>,
     stale_days: u64,
+    rescan_skip_secs: u64,
+    /// Directories refreshed this session and when (see [`is_fresh`]).
+    fresh: Vec<(PathBuf, Instant)>,
+    /// The directory the running refresh covers.
+    refreshing: Option<PathBuf>,
     ask: Ask,
     progress: Arc<Progress>,
     scan_started: Instant,
@@ -301,6 +307,13 @@ pub struct App {
     del: Option<Del>,
 }
 
+/// True if `dir` lies inside a directory refreshed less than `secs` seconds ago.
+fn is_fresh(fresh: &[(PathBuf, Instant)], dir: &Path, secs: u64) -> bool {
+    fresh
+        .iter()
+        .any(|(p, at)| dir.starts_with(p) && at.elapsed().as_secs() < secs)
+}
+
 impl App {
     fn blank(db: PathBuf, root: PathBuf, recipes: Vec<Recipe>, threads: usize) -> Self {
         Self {
@@ -318,6 +331,9 @@ impl App {
             uid: rustix::process::getuid().as_raw(),
             legacy: None,
             stale_days: 7,
+            rescan_skip_secs: 300,
+            fresh: Vec::new(),
+            refreshing: None,
             ask: Ask::NoExport,
             progress: Arc::default(),
             scan_started: Instant::now(),
@@ -359,6 +375,7 @@ impl App {
         app.bin = l.bin;
         app.legacy = l.legacy_export;
         app.stale_days = l.stale_days;
+        app.rescan_skip_secs = l.rescan_skip_secs;
         app.evaluate();
         app
     }
@@ -577,10 +594,21 @@ impl App {
             self.progress.clone(),
         );
         let recipes = self.recipes.clone();
+        let skip = is_fresh(&self.fresh, &here, self.rescan_skip_secs);
+        self.refreshing = Some(here.clone());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let res = db::refresh(&db, std::slice::from_ref(&here), threads, progress);
+            // Safe: file hits are re-checked by mtime at delete time (apply.rs check_as) and
+            // folder removal deletes what is on disk, so a stale list only affects what is shown.
+            let res = if skip {
+                Ok(db::Refreshed {
+                    files: 0,
+                    errors: 0,
+                })
+            } else {
+                db::refresh(&db, std::slice::from_ref(&here), threads, progress)
+            };
             let ok = res.is_ok() && is_dir(&here);
             if tx.send(Msg::Refreshed(res)).is_err() || !ok {
                 return;
@@ -646,6 +674,7 @@ impl App {
         self.progress = Arc::default();
         self.scan_started = Instant::now();
         self.mode = Mode::Refreshing;
+        self.refreshing = Some(scan.clone());
         let (db, threads, progress) = (self.db_path.clone(), self.threads, self.progress.clone());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
@@ -689,6 +718,7 @@ impl App {
 
     fn on_refreshed(&mut self, res: io::Result<db::Refreshed>) {
         let del = self.del.take();
+        let covered = self.refreshing.take();
         if self.mode != Mode::Refreshing {
             // esc'd: apply the finished refresh silently.
             self.rx = None;
@@ -718,6 +748,13 @@ impl App {
         }
         match res {
             Ok(_) => {
+                // A skipped refresh must not extend its own window.
+                if let Some(p) =
+                    covered.filter(|p| !is_fresh(&self.fresh, p, self.rescan_skip_secs))
+                {
+                    self.fresh.retain(|(q, _)| *q != p);
+                    self.fresh.push((p, Instant::now()));
+                }
                 self.reopen();
                 match del {
                     Some(d) => self.ask_remove(d),
@@ -981,6 +1018,8 @@ impl App {
                     self.rx = None;
                     match res {
                         Ok(files) => {
+                            self.fresh.clear();
+                            self.fresh.push((self.scan_root.clone(), Instant::now()));
                             self.browse();
                             self.status = format!(
                                 "Scan finished: {files} files in {}s",
@@ -1534,5 +1573,18 @@ impl App {
             area,
             &mut TableState::default().with_selected(Some(self.sel - off)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_covers_descendants_within_window() {
+        let f = [(PathBuf::from("/a"), Instant::now())];
+        assert!(is_fresh(&f, Path::new("/a/b"), 300));
+        assert!(!is_fresh(&f, Path::new("/c"), 300));
+        assert!(!is_fresh(&f, Path::new("/a/b"), 0));
     }
 }

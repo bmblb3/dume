@@ -11,6 +11,7 @@ struct Raw {
     root: PathBuf,
     threads: Option<u16>,
     stale_days: Option<u64>,
+    rescan_skip_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -20,6 +21,8 @@ pub struct Config {
     pub threads: usize,
     /// A scan older than this is flagged as stale.
     pub stale_days: u64,
+    /// `c` skips the rescan of a folder refreshed this recently (0: always rescan).
+    pub rescan_skip_secs: u64,
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
@@ -35,6 +38,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         root: raw.root,
         threads: threads as usize,
         stale_days: raw.stale_days.unwrap_or(7),
+        rescan_skip_secs: raw.rescan_skip_secs.unwrap_or(300),
     })
 }
 
