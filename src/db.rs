@@ -170,6 +170,26 @@ impl Db {
         Ok(t.unwrap_or(0) as u64)
     }
 
+    /// Rows strictly below `here`: what a recipe's `entries` view holds.
+    pub fn count_under(&self, here: &Path) -> io::Result<u64> {
+        let rel = self.rel(here)?;
+        let n: i64 = if rel.is_empty() {
+            self.conn
+                .query_row("SELECT COUNT(*) FROM entries WHERE path > x''", [], |r| {
+                    r.get(0)
+                })
+        } else {
+            let (lo, hi) = ([&rel[..], b"/"].concat(), [&rel[..], b"0"].concat());
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM entries WHERE path > ? AND path < ?",
+                [lo, hi],
+                |r| r.get(0),
+            )
+        }
+        .map_err(err)?;
+        Ok(n as u64)
+    }
+
     /// `p`'s stored row and the number of files at or under it, or None if it isn't stored.
     pub fn entry(&self, p: &Path) -> io::Result<Option<Entry>> {
         let rel = self.rel(p)?;

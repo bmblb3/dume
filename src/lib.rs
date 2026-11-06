@@ -1,6 +1,7 @@
 //! Shared code for the `dume` and `dume-scan` binaries.
 
 pub mod apply;
+pub mod bench;
 pub mod config;
 pub mod db;
 pub mod json;

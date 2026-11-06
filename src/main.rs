@@ -1,5 +1,5 @@
 use clap::Parser;
-use dumelib::{db, report, scan};
+use dumelib::{bench, db, report, scan};
 use std::io::{BufWriter, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,6 +34,15 @@ struct Cli {
     /// Don't scan: print what's taking space under DIR (a directory inside the database FILE)
     #[arg(short, long, value_name = "FILE", conflicts_with = "merge")]
     report: Option<PathBuf>,
+    /// Don't scan: time a scan of DIR and the recipes in --actions, using the database FILE
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["merge", "report", "json", "output"])]
+    bench: Option<PathBuf>,
+    /// With --bench: the recipes directory to time (*.sql)
+    #[arg(long, value_name = "DIR", requires = "bench")]
+    actions: Option<PathBuf>,
+    /// With --bench: recipes evaluated at once in the parallel pass
+    #[arg(long, default_value_t = 4, requires = "bench", value_parser = clap::value_parser!(u16).range(1..))]
+    parallel: u16,
     /// Rows per section in --report
     #[arg(short = 'n', long, default_value_t = 15, requires = "report")]
     top: usize,
@@ -50,6 +59,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if cli.merge.is_none()
+        && cli.bench.is_none()
         && cli.report.is_none()
         && cli.output.is_none()
         && std::io::stdout().is_terminal()
@@ -84,6 +94,16 @@ fn run(cli: &Cli) -> std::io::Result<()> {
         return r.write_text(
             &dir.to_string_lossy(),
             cli.top,
+            &mut std::io::stdout().lock(),
+        );
+    }
+    if let Some(file) = &cli.bench {
+        return bench::run(
+            file,
+            &dir.canonicalize()?,
+            cli.actions.as_deref(),
+            cli.parallel as usize,
+            cli.threads as usize,
             &mut std::io::stdout().lock(),
         );
     }

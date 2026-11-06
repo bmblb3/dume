@@ -165,8 +165,18 @@ struct Limits {
 /// `CAST('foo' AS BLOB)`. REGEXP uses `regex::bytes`, Unicode-aware by default;
 /// write `(?-u)` to match arbitrary bytes (e.g. `(?-u)\xE9`).
 pub fn select(db: &Db, r: &Recipe, here: &Path) -> Result<Selection, String> {
+    select_with_timeout(db, r, here, QUERY_TIMEOUT)
+}
+
+/// [`select`] with a caller-chosen time limit (the timing tool wants the real duration).
+pub fn select_with_timeout(
+    db: &Db,
+    r: &Recipe,
+    here: &Path,
+    timeout: Duration,
+) -> Result<Selection, String> {
     let lim = Limits {
-        timeout: QUERY_TIMEOUT,
+        timeout,
         max_rows: MAX_ROWS,
     };
     select_within(db, r, here, lim)

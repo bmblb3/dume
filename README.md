@@ -112,6 +112,7 @@ dume-scan /data -o dume.db                  # scan into a database
 dume-scan --json dume.db | ncdu -f-         # database -> ncdu JSON
 dume-scan /data/proj/old -m dume.db         # rescan one dir, update the database in place
 dume-scan /data/proj -r dume.db             # text report; no scan
+dume-scan /data/proj --bench dume.db --actions PREFIX/share/dume/actions   # where does `c` spend its time?
 ```
 
 ```
@@ -128,6 +129,7 @@ dume-scan --json FILE
 | `-m, --merge FILE` | off | rescan `DIR` and update the database `FILE` in place |
 | `-r, --report FILE` | off | no scan: print what takes space under `DIR`, from a database |
 | `-n, --top` | 15 | rows per `--report` section |
+| `--bench FILE` | off | no scan write: time a scan of `DIR` and each recipe in `--actions DIR` (one at a time, then `--parallel N` at once, default 4); read-only |
 | `-v, --verbose` | off | print each unreadable path (default: just a count) |
 
 JSON is never written to a terminal (exit 2). Exit codes: `0` ok, `1` runtime error, `2` usage error.
