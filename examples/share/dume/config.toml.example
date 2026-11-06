@@ -7,3 +7,4 @@ root = "/path/to/shared/root"
 # threads = 32      # concurrent stats per scan; lower it if many people scan at once
 # stale_days = 7    # warn when a user's scan is older than this
 # rescan_skip_secs = 300  # c skips rescanning a folder refreshed this recently; 0 = always rescan
+# prune = [".git", ".venv", ".direnv", "processor[0-9]*", "dynamicCode"]  # sized, not indexed; full rescan to apply

@@ -37,6 +37,9 @@ struct Cli {
     /// Rows per section in --report
     #[arg(short = 'n', long, default_value_t = 15, requires = "report")]
     top: usize,
+    /// With -o: directory name glob to size but not store, e.g. '.git' (repeatable)
+    #[arg(long, value_name = "GLOB", requires = "output")]
+    prune: Vec<String>,
     /// Print each unreadable path to stderr (default: only a count)
     #[arg(short, long)]
     verbose: bool,
@@ -94,8 +97,15 @@ fn run(cli: &Cli) -> std::io::Result<()> {
         .unwrap_or_else(|| rustix::process::getuid().as_raw());
     let wrap = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
     if let Some(file) = &cli.output {
-        let n =
-            db::scan_to_db(dir, file, uid, cli.threads as usize, progress.clone()).map_err(wrap)?;
+        let n = db::scan_to_db_pruned(
+            dir,
+            file,
+            uid,
+            cli.threads as usize,
+            progress.clone(),
+            &cli.prune,
+        )
+        .map_err(wrap)?;
         return summary(n, progress_errors(&progress), uid, false);
     }
     let (scan, dev) = scan::scan(dir, uid, cli.threads as usize, cli.verbose).map_err(wrap)?;

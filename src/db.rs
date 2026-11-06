@@ -18,7 +18,7 @@
 
 use crate::json;
 use crate::merge;
-use crate::scan::{DirView, FileRec, Progress, Scan, scan_progress};
+use crate::scan::{DirView, FileRec, Progress, Prune, Scan, scan_pruned};
 use rusqlite::{Connection, OpenFlags, params};
 use rustix::fs::{FlockOperation, flock};
 use std::io::{self, Write};
@@ -43,12 +43,16 @@ pub struct Meta {
     pub uid: u32,
     pub scanned: u64,
     pub progver: String,
+    /// Prune globs the scan was made with (newline-separated in `meta`).
+    pub prune: Vec<String>,
 }
 
 pub struct Child {
     pub name: Vec<u8>,
     pub size: u64,
     pub is_dir: bool,
+    /// Pruned directory: sized, but its contents are not stored.
+    pub pruned: bool,
 }
 
 fn meta_of(c: &Connection) -> rusqlite::Result<Meta> {
@@ -76,13 +80,34 @@ fn meta_of(c: &Connection) -> rusqlite::Result<Meta> {
         uid: int("uid")? as u32,
         scanned: int("scanned")? as u64,
         progver: String::from_utf8_lossy(&blob("progver")?).into_owned(),
+        prune: blob("prune")
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+/// Databases from before pruning have no `files` column.
+fn check_schema(c: &Connection) -> io::Result<()> {
+    let has = c.prepare("SELECT files FROM entries LIMIT 0").is_ok();
+    if has {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "this scan was made by an older dume; scan again",
+        ))
+    }
 }
 
 impl Db {
     pub fn open_ro(path: &Path) -> io::Result<Db> {
         let conn =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+        check_schema(&conn)?;
         let root = meta_of(&conn).map_err(err)?.root;
         Ok(Db {
             conn,
@@ -112,7 +137,7 @@ impl Db {
     pub fn children(&self, here: &Path) -> io::Result<Vec<Child>> {
         let mut st = self
             .conn
-            .prepare_cached("SELECT name, tree_size, is_dir FROM entries WHERE parent=? ORDER BY tree_size DESC, name")
+            .prepare_cached("SELECT name, tree_size, is_dir, files IS NOT NULL FROM entries WHERE parent=? ORDER BY tree_size DESC, name")
             .map_err(err)?;
         let rows = st
             .query_map([self.rel(here)?], |r| {
@@ -120,6 +145,7 @@ impl Db {
                     name: r.get(0)?,
                     size: r.get::<_, i64>(1)? as u64,
                     is_dir: r.get(2)?,
+                    pruned: r.get(3)?,
                 })
             })
             .map_err(err)?;
@@ -148,16 +174,25 @@ impl Db {
     pub fn entry(&self, p: &Path) -> io::Result<Option<Entry>> {
         let rel = self.rel(p)?;
         let row = self.conn.query_row(
-            "SELECT is_dir, CASE WHEN is_dir THEN tree_size ELSE dsize END, mtime FROM entries WHERE path=?",
+            "SELECT is_dir, CASE WHEN is_dir THEN tree_size ELSE dsize END, mtime, files FROM entries WHERE path=?",
             [&rel],
-            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
         );
-        let (is_dir, size, mtime) = match row {
+        let (is_dir, size, mtime, folded) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(err(e)),
         };
-        let files = if is_dir {
+        let files = if let Some(n) = folded {
+            n as u64
+        } else if is_dir {
             let (lo, hi) = ([&rel[..], b"/"].concat(), [&rel[..], b"0"].concat());
             self.conn
                 .query_row(
@@ -249,12 +284,13 @@ impl Db {
     fn walk_dir(&self, rel: &[u8], f: &mut dyn FnMut(Ev) -> io::Result<()>) -> io::Result<()> {
         let mut st = self
             .conn
-            .prepare_cached("SELECT name, is_dir, asize, dsize, ino, nlink, mtime FROM entries WHERE parent=? ORDER BY is_dir, name")
+            .prepare_cached("SELECT name, is_dir, asize, dsize, ino, nlink, mtime, files IS NOT NULL, tree_size FROM entries WHERE parent=? ORDER BY is_dir, name")
             .map_err(err)?;
-        let rows: Vec<(bool, DbFile)> = st
+        let rows: Vec<(bool, bool, DbFile, u64)> = st
             .query_map([rel], |r| {
                 Ok((
                     r.get(1)?,
+                    r.get(7)?,
                     DbFile {
                         name: r.get(0)?,
                         asize: r.get::<_, i64>(2)? as u64,
@@ -263,14 +299,28 @@ impl Db {
                         nlink: r.get::<_, i64>(5)? as u64,
                         mtime: r.get(6)?,
                     },
+                    r.get::<_, i64>(8)? as u64,
                 ))
             })
             .map_err(err)?
             .collect::<Result<_, _>>()
             .map_err(err)?;
         drop(st);
-        for (is_dir, r) in &rows {
-            if *is_dir {
+        for (is_dir, pruned, r, tree) in &rows {
+            if *pruned {
+                // The export has no rows for what was pruned: one stand-in file carries the size.
+                f(Ev::Open(&r.name))?;
+                let rest = DbFile {
+                    name: b"(not indexed)".to_vec(),
+                    asize: *tree,
+                    dsize: *tree,
+                    ino: 0,
+                    nlink: 1,
+                    mtime: None,
+                };
+                f(Ev::File(&rest))?;
+                f(Ev::Close)?;
+            } else if *is_dir {
                 f(Ev::Open(&r.name))?;
                 self.walk_dir(&join(rel, &r.name), f)?;
                 f(Ev::Close)?;
@@ -331,10 +381,24 @@ pub fn scan_to_db(
     threads: usize,
     progress: Arc<Progress>,
 ) -> io::Result<u64> {
+    scan_to_db_pruned(root, db, uid, threads, progress, &[])
+}
+
+/// [`scan_to_db`] storing directories whose name matches a `prune` glob as one sized row.
+/// The globs are kept in the database, so later refreshes prune the same way.
+pub fn scan_to_db_pruned(
+    root: &Path,
+    db: &Path,
+    uid: u32,
+    threads: usize,
+    progress: Arc<Progress>,
+    prune: &[String],
+) -> io::Result<u64> {
+    let matcher = Prune::new(prune).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     atomic(db, |tmp| {
-        let (scan, dev) = scan_progress(root, uid, threads, false, progress, true)?;
+        let (scan, dev) = scan_pruned(root, uid, threads, false, progress, true, matcher)?;
         let p = plan(|f| scan.for_each_dir(f), b"", &|_| false);
-        write_db(tmp, &p, root, dev, uid)?;
+        write_db(tmp, &p, root, dev, uid, prune)?;
         Ok(scan.files)
     })
 }
@@ -394,6 +458,8 @@ pub fn import_json(json: &Path, db: &Path) -> io::Result<u64> {
                         parent: *parent,
                         name,
                         files,
+                        pruned: false,
+                        folded: &[],
                     });
                 }
             },
@@ -407,12 +473,20 @@ pub fn import_json(json: &Path, db: &Path) -> io::Result<u64> {
             Path::new(&ex.root_name()),
             ex.dev().unwrap_or(0),
             uid,
+            &[],
         )?;
         Ok(files)
     })
 }
 
-fn write_db(tmp: &Path, plan: &Plan, root: &Path, dev: u64, uid: u32) -> io::Result<()> {
+fn write_db(
+    tmp: &Path,
+    plan: &Plan,
+    root: &Path,
+    dev: u64,
+    uid: u32,
+    prune: &[String],
+) -> io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -423,7 +497,7 @@ fn write_db(tmp: &Path, plan: &Plan, root: &Path, dev: u64, uid: u32) -> io::Res
         "PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;
          CREATE TABLE entries(path BLOB PRIMARY KEY, parent BLOB, name BLOB, is_dir INTEGER,
            asize INTEGER, dsize INTEGER, ino INTEGER, nlink INTEGER, mtime INTEGER NULL,
-           tree_size INTEGER);
+           tree_size INTEGER, files INTEGER NULL);
          CREATE TABLE meta(key TEXT PRIMARY KEY, value);",
     )
     .map_err(err)?;
@@ -443,6 +517,8 @@ fn write_db(tmp: &Path, plan: &Plan, root: &Path, dev: u64, uid: u32) -> io::Res
         m.execute(params!["uid", uid as i64]).map_err(err)?;
         m.execute(params!["scanned", now as i64]).map_err(err)?;
         m.execute(params!["progver", env!("CARGO_PKG_VERSION")])
+            .map_err(err)?;
+        m.execute(params!["prune", prune.join("\n").into_bytes()])
             .map_err(err)?;
     }
     tx.commit().map_err(err)?;
@@ -494,6 +570,8 @@ struct PDir {
     files: Vec<FileRec>,
     /// What each file adds to `tree_size` (0 for repeat hardlinks).
     counted: Vec<u64>,
+    /// A pruned directory: how many files it holds. Stored in `entries.files`.
+    folded: Option<u64>,
 }
 
 fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
@@ -513,20 +591,29 @@ fn plan(
     // Directory ids ascend parent-before-child, so a reverse pass sums children first.
     let mut up = Vec::new();
     let mut dirs: Vec<PDir> = Vec::new();
+    let mut folded_sizes: Vec<u64> = Vec::new();
     // Later hardlinks to an inode already seen contribute 0 (matches report/JSON).
     let mut seen = std::collections::HashSet::new();
     each_dir(&mut |d| {
-        let counted = d
+        // shortcut: a hardlink inside a pruned directory is deduplicated here, but not by a
+        // later `refresh` of the other link (no row to find); upgrade by storing those rows.
+        let mut count = |ino, nlink, dsize| {
+            if nlink > 1 && (held(ino) || !seen.insert(ino)) {
+                0
+            } else {
+                dsize
+            }
+        };
+        let counted: Vec<u64> = d
             .files
             .iter()
-            .map(|f| {
-                if f.nlink > 1 && (held(f.ino) || !seen.insert(f.ino)) {
-                    0
-                } else {
-                    f.dsize
-                }
-            })
+            .map(|f| count(f.ino, f.nlink, f.dsize))
             .collect();
+        let folded_size: u64 = d
+            .folded
+            .iter()
+            .map(|f| count(f.ino, f.nlink, f.dsize))
+            .sum();
         let (path, parent, name) = match d.parent {
             None if base.is_empty() => (Vec::new(), None, d.name.to_vec()),
             None => {
@@ -546,10 +633,19 @@ fn plan(
             name,
             files: d.files.to_vec(),
             counted,
+            folded: d.pruned.then_some(d.folded.len() as u64),
         });
+        folded_sizes.push(folded_size);
     });
-    let mut tree: Vec<u64> = dirs.iter().map(|d| d.counted.iter().sum()).collect();
-    let mut keep: Vec<bool> = dirs.iter().map(|d| !d.files.is_empty()).collect();
+    let mut tree: Vec<u64> = dirs
+        .iter()
+        .zip(&folded_sizes)
+        .map(|(d, f)| d.counted.iter().sum::<u64>() + f)
+        .collect();
+    let mut keep: Vec<bool> = dirs
+        .iter()
+        .map(|d| !d.files.is_empty() || d.folded.is_some_and(|n| n > 0))
+        .collect();
     for i in (0..dirs.len()).rev() {
         if let Some(p) = up[i] {
             tree[p] += tree[i];
@@ -586,7 +682,7 @@ fn ancestors(p: &[u8]) -> Vec<Vec<u8>> {
 impl Plan {
     fn insert(&self, c: &Connection) -> io::Result<()> {
         let mut ins = c
-            .prepare_cached("INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .prepare_cached("INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .map_err(err)?;
         for (i, d) in self.dirs.iter().enumerate() {
             if !self.keep[i] {
@@ -602,7 +698,8 @@ impl Plan {
                 0,
                 0,
                 None::<i64>,
-                self.tree[i] as i64
+                self.tree[i] as i64,
+                d.folded.map(|n| n as i64)
             ])
             .map_err(err)?;
             for (f, &cnt) in d.files.iter().zip(&d.counted) {
@@ -616,7 +713,8 @@ impl Plan {
                     f.ino as i64,
                     f.nlink as i64,
                     (!self.null_mtime).then_some(f.mtime),
-                    cnt as i64
+                    cnt as i64,
+                    None::<i64>
                 ])
                 .map_err(err)?;
             }
@@ -659,7 +757,9 @@ pub fn refresh(
     // A reader (e.g. a recipe query) can hold the file for up to its own 30 s deadline.
     conn.busy_timeout(std::time::Duration::from_secs(30))
         .map_err(err)?;
+    check_schema(&conn)?;
     let m = meta_of(&conn).map_err(err)?;
+    let prune = Prune::new(&m.prune).map_err(io::Error::other)?;
     let mut rels = Vec::new();
     for d in dirs {
         let r = d.strip_prefix(&m.root).ok().filter(|r| {
@@ -676,7 +776,16 @@ pub fn refresh(
         errors: 0,
     };
     for (d, rel) in dirs.iter().zip(&rels) {
-        let scan = match scan_progress(d, m.uid, threads, false, progress.clone(), true) {
+        // A refresh of a pruned directory itself must fold it too.
+        let scan = match scan_pruned(
+            d,
+            m.uid,
+            threads,
+            false,
+            progress.clone(),
+            true,
+            prune.clone().with_root(!rel.is_empty()),
+        ) {
             Ok((s, _)) => Some(s),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e), // dropping `tx` rolls everything back
@@ -758,7 +867,7 @@ fn replace(tx: &Connection, rel: &[u8], scan: Option<&Scan>) -> io::Result<()> {
                     (Some(x), n)
                 };
                 tx.execute(
-                    "INSERT OR IGNORE INTO entries VALUES(?,?,?,1,0,0,0,0,NULL,0)",
+                    "INSERT OR IGNORE INTO entries VALUES(?,?,?,1,0,0,0,0,NULL,0,NULL)",
                     params![a, par, name],
                 )
                 .map_err(err)?;

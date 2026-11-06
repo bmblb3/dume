@@ -251,6 +251,7 @@ pub struct Launch {
     pub threads: usize,
     pub stale_days: u64,
     pub rescan_skip_secs: u64,
+    pub prune: Vec<String>,
     pub uid: u32,
 }
 
@@ -273,6 +274,7 @@ pub struct App {
     legacy: Option<PathBuf>,
     stale_days: u64,
     rescan_skip_secs: u64,
+    prune: Vec<String>,
     /// Directories refreshed this session and when (see [`is_fresh`]).
     fresh: Vec<(PathBuf, Instant)>,
     /// The directory the running refresh covers.
@@ -332,6 +334,7 @@ impl App {
             legacy: None,
             stale_days: 7,
             rescan_skip_secs: 300,
+            prune: Vec::new(),
             fresh: Vec::new(),
             refreshing: None,
             ask: Ask::NoExport,
@@ -376,6 +379,7 @@ impl App {
         app.legacy = l.legacy_export;
         app.stale_days = l.stale_days;
         app.rescan_skip_secs = l.rescan_skip_secs;
+        app.prune = l.prune;
         app.evaluate();
         app
     }
@@ -432,11 +436,12 @@ impl App {
         self.progress = Arc::default();
         self.scan_started = Instant::now();
         self.mode = Mode::Scanning;
-        let (root, db, uid, threads) = (
+        let (root, db, uid, threads, prune) = (
             self.scan_root.clone(),
             self.db_path.clone(),
             self.uid,
             self.threads,
+            self.prune.clone(),
         );
         let progress = self.progress.clone();
         let (tx, rx) = mpsc::channel();
@@ -445,7 +450,7 @@ impl App {
             let res = db
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| db::scan_to_db(&root, &db, uid, threads, progress));
+                .and_then(|()| db::scan_to_db_pruned(&root, &db, uid, threads, progress, &prune));
             let _ = tx.send(Msg::Scanned(res));
         });
     }
@@ -525,6 +530,13 @@ impl App {
         let Some(c) = self.children.get(self.sel).filter(|c| c.is_dir) else {
             return;
         };
+        if c.pruned {
+            self.status = format!(
+                "{} is pruned: its size is counted but its contents are not indexed.",
+                String::from_utf8_lossy(&c.name)
+            );
+            return;
+        }
         let new_root = self.root.join(OsStr::from_bytes(&c.name));
         let old = std::mem::replace(&mut self.root, new_root);
         self.stack.push((old, self.sel));
@@ -1549,7 +1561,9 @@ impl App {
                 TRow::new([
                     human(c.size),
                     format!("{:.1}%", pct(c.size, self.total)),
-                    if c.is_dir {
+                    if c.pruned {
+                        format!("{name}/ (not indexed)")
+                    } else if c.is_dir {
                         format!("{name}/")
                     } else {
                         name.into_owned()

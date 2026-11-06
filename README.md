@@ -92,8 +92,17 @@ STAR-CCM+ and ANSA examples are placeholders that fail until you fill in the `TO
 | `threads` | 32 | concurrent stats per scan; lower it if many people scan at once |
 | `stale_days` | 7 | warn when a scan is older |
 | `rescan_skip_secs` | 300 | `c` skips the rescan of a folder (re)scanned this recently in the session; 0 = always rescan |
+| `prune` | `[]` | directory-name globs (`*` `?` `[..]`, matched at any depth) that are walked for their size but not stored, e.g. `[".git", ".venv", "processor[0-9]*"]` |
 
 Unknown keys are errors.
+
+**Pruning.** A pruned folder is one row in the scan: its size and file count are right, but its contents are
+not indexed. Browsing shows it as `(not indexed)` and does not enter it; recipes never see inside it (they can
+still match the folder by name); `x` still removes it; the ncdu export shows one `(not indexed)` file holding its
+size. The scan still walks it, so pruning speeds up recipes and browsing, not the scan. The globs are saved in the
+scan, so refreshes prune the same way; after changing `prune`, press `r` for a full rescan. Scans made by an older
+dume are refused with a prompt to scan again. Known limit: a hardlink between a pruned folder and a normal one
+counts once in a full scan, but a later refresh of only the normal side can miscount that one file.
 
 ## dume-scan
 

@@ -12,6 +12,7 @@ struct Raw {
     threads: Option<u16>,
     stale_days: Option<u64>,
     rescan_skip_secs: Option<u64>,
+    prune: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -23,6 +24,8 @@ pub struct Config {
     pub stale_days: u64,
     /// `c` skips the rescan of a folder refreshed this recently (0: always rescan).
     pub rescan_skip_secs: u64,
+    /// Directory name globs scanned for size only (`.git`, `processor[0-9]*`).
+    pub prune: Vec<String>,
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
@@ -34,11 +37,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if threads == 0 {
         return Err("threads must be at least 1".into());
     }
+    let prune = raw.prune.unwrap_or_default();
+    crate::scan::Prune::new(&prune).map_err(|e| format!("prune: {e}"))?;
     Ok(Config {
         root: raw.root,
         threads: threads as usize,
         stale_days: raw.stale_days.unwrap_or(7),
         rescan_skip_secs: raw.rescan_skip_secs.unwrap_or(300),
+        prune,
     })
 }
 

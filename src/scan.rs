@@ -30,12 +30,94 @@ pub struct FileRec {
     pub mtime: i64,
 }
 
+/// A file inside a pruned directory: enough to size it and count hardlinks, nothing more.
+#[derive(Clone, Copy, Debug)]
+pub struct Fold {
+    pub ino: u64,
+    pub nlink: u64,
+    pub dsize: u64,
+}
+
 /// A directory with the files kept in it, as seen by [`Scan::for_each_dir`].
 pub struct DirView<'a> {
     pub id: usize,
     pub parent: Option<usize>,
     pub name: &'a [u8],
     pub files: &'a [FileRec],
+    /// A pruned directory: `folded` holds everything beneath it, `files` is empty.
+    pub pruned: bool,
+    pub folded: &'a [Fold],
+}
+
+/// Directory names to walk for their size but not to store (`.git`, `processor[0-9]*`):
+/// shell-style globs (`*`, `?`, `[..]`) matched against the whole name, at any depth.
+#[derive(Clone, Debug, Default)]
+pub struct Prune {
+    re: Option<regex::bytes::Regex>,
+    /// Prune the scan root itself too (a refresh of a pruned directory).
+    root: bool,
+}
+
+impl Prune {
+    pub fn new(globs: &[String]) -> Result<Prune, String> {
+        if globs.is_empty() {
+            return Ok(Prune::default());
+        }
+        let alts: Result<Vec<String>, String> = globs.iter().map(|g| glob_regex(g)).collect();
+        let re = format!("^(?:{})$", alts?.join("|"));
+        let re = regex::bytes::Regex::new(&re).map_err(|e| e.to_string())?;
+        Ok(Prune {
+            re: Some(re),
+            root: false,
+        })
+    }
+
+    /// Also prune the scan root, if its own name matches.
+    pub fn with_root(mut self, yes: bool) -> Prune {
+        self.root = yes;
+        self
+    }
+
+    pub fn matches(&self, name: &[u8]) -> bool {
+        self.re.as_ref().is_some_and(|r| r.is_match(name))
+    }
+}
+
+fn glob_regex(g: &str) -> Result<String, String> {
+    if g.is_empty() || g.contains('/') {
+        return Err(format!(
+            "prune pattern {g:?} must be a plain directory name pattern"
+        ));
+    }
+    let mut out = String::new();
+    let mut it = g.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '*' => out.push_str("[^/]*"),
+            '?' => out.push_str("[^/]"),
+            '[' => {
+                out.push('[');
+                let mut closed = false;
+                for c in it.by_ref() {
+                    match c {
+                        '!' if out.ends_with('[') => out.push('^'),
+                        '\\' => out.push_str("\\\\"),
+                        ']' => {
+                            out.push(']');
+                            closed = true;
+                            break;
+                        }
+                        c => out.push(c),
+                    }
+                }
+                if !closed {
+                    return Err(format!("prune pattern {g:?} has an unclosed ["));
+                }
+            }
+            c => out.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -47,6 +129,9 @@ struct Node {
     recs: Vec<FileRec>,
     /// Indices of child directories (always greater than this node's index).
     subs: Vec<usize>,
+    /// Pruned: everything beneath is folded into `folded` instead of getting nodes.
+    pruned: bool,
+    folded: Vec<Fold>,
 }
 
 /// Live counters, readable from another thread while a scan runs.
@@ -64,6 +149,7 @@ struct Ctx {
     stats: Arc<Progress>,
     verbose_errors: bool,
     records: bool,
+    prune: Prune,
 }
 
 impl Ctx {
@@ -101,16 +187,47 @@ pub fn scan_progress(
     progress: Arc<Progress>,
     records: bool,
 ) -> io::Result<(Scan, u64)> {
+    scan_pruned(
+        root,
+        uid,
+        threads,
+        verbose_errors,
+        progress,
+        records,
+        Prune::default(),
+    )
+}
+
+/// [`scan_progress`] folding directories that match `prune` (only with `records`: the
+/// ncdu export has no place for them).
+pub fn scan_pruned(
+    root: &Path,
+    uid: u32,
+    threads: usize,
+    verbose_errors: bool,
+    progress: Arc<Progress>,
+    records: bool,
+    prune: Prune,
+) -> io::Result<(Scan, u64)> {
+    let prune = if records { prune } else { Prune::default() };
+    let root_pruned = prune.root
+        && root
+            .file_name()
+            .is_some_and(|n| prune.matches(n.as_bytes()));
     let rootfd = open_dir(rustix::fs::CWD, root)?;
     let st = statat(&rootfd, ".", AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     let dev = st.st_dev as u64;
     let ctx = Ctx {
         uid,
         dev,
-        arena: Mutex::new(vec![Node::default()]),
+        arena: Mutex::new(vec![Node {
+            pruned: root_pruned,
+            ..Node::default()
+        }]),
         stats: progress,
         verbose_errors,
         records,
+        prune,
     };
     drop(rootfd);
 
@@ -125,7 +242,7 @@ pub fn scan_progress(
     pool.install(|| {
         rayon::scope(|s| {
             let (path, root_ctx) = (root.to_path_buf(), &ctx);
-            finish(root_ctx, 0, &path, first, s);
+            finish(root_ctx, 0, None, &path, first, s);
         })
     });
 
@@ -276,25 +393,44 @@ fn stat_chunk(
 }
 
 /// Record a finished listing for node `idx` and spawn tasks for its subdirectories.
-fn finish<'s>(ctx: &'s Ctx, idx: usize, path: &Path, l: Listing, scope: &rayon::Scope<'s>) {
+/// `owner`: the pruned node this directory lies inside, which gets the files instead.
+fn finish<'s>(
+    ctx: &'s Ctx,
+    idx: usize,
+    owner: Option<usize>,
+    path: &Path,
+    l: Listing,
+    scope: &rayon::Scope<'s>,
+) {
     ctx.stats.files.fetch_add(l.count, Ordering::Relaxed);
-    let ids: Vec<usize> = {
+    let ids: Vec<(usize, Option<usize>)> = {
         let mut arena = ctx.arena.lock().unwrap();
-        arena[idx].files = l.files;
-        arena[idx].recs = l.recs;
-        let first = arena.len();
-        arena.extend(l.subdirs.iter().map(|n| Node {
-            name: n.clone(),
-            ..Node::default()
-        }));
-        let ids: Vec<usize> = (first..arena.len()).collect();
-        arena[idx].subs = ids.clone();
-        ids
+        let owner = owner.or(arena[idx].pruned.then_some(idx));
+        if let Some(o) = owner {
+            arena[o].folded.extend(l.recs.iter().map(|f| Fold {
+                ino: f.ino,
+                nlink: f.nlink,
+                dsize: f.dsize,
+            }));
+            vec![(o, Some(o)); l.subdirs.len()]
+        } else {
+            arena[idx].files = l.files;
+            arena[idx].recs = l.recs;
+            let first = arena.len();
+            arena.extend(l.subdirs.iter().map(|n| Node {
+                name: n.clone(),
+                pruned: ctx.prune.matches(n),
+                ..Node::default()
+            }));
+            let ids: Vec<usize> = (first..arena.len()).collect();
+            arena[idx].subs = ids.clone();
+            ids.into_iter().map(|i| (i, None)).collect()
+        }
     };
-    for (id, name) in ids.into_iter().zip(l.subdirs) {
+    for ((id, owner), name) in ids.into_iter().zip(l.subdirs) {
         let child = path.join(OsStr::from_bytes(&name));
         scope.spawn(move |s| match read_dir(ctx, &child) {
-            Ok(l) => finish(ctx, id, &child, l, s),
+            Ok(l) => finish(ctx, id, owner, &child, l, s),
             Err(e) => ctx.warn(&child, "opening", e),
         });
     }
@@ -315,6 +451,8 @@ impl Scan {
                 parent: parent[id],
                 name: &n.name,
                 files: &n.recs,
+                pruned: n.pruned,
+                folded: &n.folded,
             });
         }
     }
