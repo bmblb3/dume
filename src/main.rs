@@ -86,13 +86,30 @@ fn run(cli: &Cli) -> std::io::Result<()> {
         let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
         return db::Db::open_ro(file)?.write_json(&mut out);
     }
-    let dir = cli.dir.as_ref().expect("clap requires DIR without --json");
+    let given = cli.dir.as_ref().expect("clap requires DIR without --json");
+    let fail =
+        |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", given.display()));
+    // dume never follows symlinks, DIR itself included: name the real directory instead.
+    if given.symlink_metadata().map_err(fail)?.is_symlink() {
+        let real = given.canonicalize().map_err(fail)?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink; dume does not follow symlinks. Give the real directory: {}",
+                given.display(),
+                real.display()
+            ),
+        ));
+    }
+    // Absolute and resolved, so a database made with a relative DIR is found again by
+    // `-m`/`-r` from anywhere. (Symlinks above DIR were always followed by the open.)
+    let dir = &given.canonicalize().map_err(fail)?;
     let progress: std::sync::Arc<scan::Progress> = Default::default();
     if let Some(file) = &cli.report {
         let d = db::Db::open_ro(file)?;
-        let r = report::analyse_db(&d, &dir.canonicalize()?, false)?;
+        let r = report::analyse_db(&d, dir, false)?;
         return r.write_text(
-            &dir.to_string_lossy(),
+            &given.to_string_lossy(),
             cli.top,
             &mut std::io::stdout().lock(),
         );
@@ -100,7 +117,7 @@ fn run(cli: &Cli) -> std::io::Result<()> {
     if let Some(file) = &cli.bench {
         return bench::run(
             file,
-            &dir.canonicalize()?,
+            dir,
             cli.actions.as_deref(),
             cli.parallel as usize,
             cli.threads as usize,
@@ -109,13 +126,17 @@ fn run(cli: &Cli) -> std::io::Result<()> {
     }
     if let Some(file) = &cli.merge {
         let uid = db::Db::open_ro(file)?.meta()?.uid;
-        let r = db::refresh(file, &[dir.canonicalize()?], cli.threads as usize, progress)?;
+        let r = db::refresh(
+            file,
+            std::slice::from_ref(dir),
+            cli.threads as usize,
+            progress,
+        )?;
         return summary(r.files, r.errors, uid, false);
     }
     let uid = cli
         .uid
         .unwrap_or_else(|| rustix::process::getuid().as_raw());
-    let wrap = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
     if let Some(file) = &cli.output {
         let n = db::scan_to_db_pruned(
             dir,
@@ -125,12 +146,13 @@ fn run(cli: &Cli) -> std::io::Result<()> {
             progress.clone(),
             &cli.prune,
         )
-        .map_err(wrap)?;
+        .map_err(fail)?;
         return summary(n, progress_errors(&progress), uid, false);
     }
-    let (scan, dev) = scan::scan(dir, uid, cli.threads as usize, cli.verbose).map_err(wrap)?;
+    let (scan, dev) = scan::scan(dir, uid, cli.threads as usize, cli.verbose).map_err(fail)?;
     let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
-    let root = dir.to_string_lossy();
+    // ncdu shows this at the top: the directory as the user named it.
+    let root = given.to_string_lossy();
     scan.write(&mut out, &root, dev, uid, env!("CARGO_PKG_VERSION"))?;
     summary(scan.files, scan.errors, uid, true)
 }

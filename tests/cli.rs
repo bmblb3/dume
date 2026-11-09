@@ -755,3 +755,58 @@ fn import_rejects_missing_names_and_uid_conflicts() {
         assert_eq!(run(&a).0, 2, "{flag}");
     }
 }
+
+/// Run with a working directory, for relative arguments.
+fn run_in(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+    let o = dume()
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        o.status.code().unwrap(),
+        String::from_utf8(o.stdout).unwrap(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn relative_dir_is_stored_absolute_so_merge_and_report_find_it() {
+    let t = tree();
+    let parent = t.path().parent().unwrap();
+    let name = t.path().file_name().unwrap().to_str().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("me.db");
+    let f = f.to_str().unwrap();
+    let (c, _, e) = run_in(parent, &[name, "-o", f]);
+    assert_eq!(c, 0, "{e}");
+    let (c, _, e) = run_in(parent, &[name, "-m", f]);
+    assert_eq!(c, 0, "merge: {e}");
+    // From another working directory, by absolute path.
+    let (c, out, e) = run(&[t.path().join("a").to_str().unwrap(), "-r", f]);
+    assert_eq!(c, 0, "report: {e}");
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn symlinked_dir_argument_is_refused_with_the_real_directory_named() {
+    let t = tree();
+    let side = tempfile::tempdir().unwrap();
+    let link = side.path().join("data");
+    symlink(t.path(), &link).unwrap();
+    let real = t.path().canonicalize().unwrap();
+    for args in [
+        vec![link.to_str().unwrap()],
+        vec![link.to_str().unwrap(), "-o", "x.db"],
+    ] {
+        let (c, _, e) = run_in(side.path(), &args);
+        assert_eq!(c, 1, "{e}");
+        assert!(e.contains("is a symlink"), "{e}");
+        assert!(e.contains(real.to_str().unwrap()), "{e}");
+    }
+    assert!(!side.path().join("x.db").exists());
+    // A symlink higher up in the path is fine (only DIR itself is checked).
+    let (c, _, e) = run(&[link.join("a").to_str().unwrap()]);
+    assert_eq!(c, 0, "{e}");
+}
