@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Every branch push (not tags: the release workflow checks those).
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 env:
