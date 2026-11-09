@@ -133,6 +133,46 @@ fn old_databases_are_refused() {
 }
 
 #[test]
+fn unreadable_databases_are_not_called_old() {
+    let t = tempfile::tempdir().unwrap();
+    let dbp = t.path().join("junk.db");
+    std::fs::write(&dbp, vec![7u8; 4096]).unwrap();
+    let e = Db::open_ro(&dbp).err().unwrap().to_string();
+    assert!(!e.contains("older dume"), "{e}");
+    assert!(e.contains("not a database"), "{e}");
+}
+
+#[test]
+fn locked_databases_say_locked_not_old() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("data");
+    write(&root.join("a/f"), 10);
+    let dbp = t.path().join("dume.db");
+    scan_to_db(&root, &dbp, uid(), 1, Default::default()).unwrap();
+    // A writer in the middle of a commit holds an exclusive lock.
+    let w = rusqlite::Connection::open(&dbp).unwrap();
+    w.execute_batch("BEGIN EXCLUSIVE; INSERT INTO meta VALUES('x', 1);")
+        .unwrap();
+    let r = rusqlite::Connection::open_with_flags(&dbp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    r.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let e = r
+        .prepare("SELECT files FROM entries LIMIT 0")
+        .err()
+        .unwrap();
+    assert_eq!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy)
+    );
+    // Through dume: the 5 s default wait, then a message that names the lock.
+    let e = Db::open_ro(&dbp).err().unwrap().to_string();
+    assert!(!e.contains("older dume"), "{e}");
+    assert!(e.contains("locked"), "{e}");
+    w.execute_batch("ROLLBACK").unwrap();
+    Db::open_ro(&dbp).unwrap();
+}
+
+#[test]
 fn glob_patterns() {
     let p = Prune::new(&globs(&[".git", "processor[0-9]*", "dyn?mic*", "[!a]x"])).unwrap();
     for yes in ["processor0", "processor12", ".git", "dynamicCode", "bx"] {

@@ -92,14 +92,27 @@ fn meta_of(c: &Connection) -> rusqlite::Result<Meta> {
 }
 
 /// Databases from before pruning have no `files` column.
+///
+/// SQLite reads the file lazily, so this is the first real read: only a missing
+/// `files` column means an old scan. Anything else (a lock, an I/O error) is
+/// reported as itself, never as "older dume".
 fn check_schema(c: &Connection) -> io::Result<()> {
-    let has = c.prepare("SELECT files FROM entries LIMIT 0").is_ok();
-    if has {
-        Ok(())
-    } else {
-        Err(io::Error::other(
+    match c.prepare("SELECT files FROM entries LIMIT 0") {
+        Ok(_) => Ok(()),
+        // rusqlite reports prepare errors as SqlInputError; keep SqliteFailure for safety.
+        Err(
+            rusqlite::Error::SqlInputError { msg: m, .. }
+            | rusqlite::Error::SqliteFailure(_, Some(m)),
+        ) if m == "no such column: files" => Err(io::Error::other(
             "this scan was made by an older dume; scan again",
-        ))
+        )),
+        Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
+            Err(io::Error::other(
+                "the scan is locked: another dume is updating it, or file locking does \
+                 not work on this filesystem; try again in a moment",
+            ))
+        }
+        Err(e) => Err(err(e)),
     }
 }
 
