@@ -39,6 +39,53 @@ pub enum Mode {
     Confirm,
     Running,
     Done,
+    /// `Q`: the steps queued with `a`, to review, drop or run.
+    Queue,
+    /// Run every queued step?
+    QueueConfirm,
+    /// Quitting with steps still queued.
+    QuitAsk,
+}
+
+/// One queued step: a recipe's ticked hits, in the folder they were picked in. Running it
+/// goes through `apply::run` like any other run, so every path is checked again then.
+#[derive(Clone)]
+struct Queued {
+    recipe: Recipe,
+    here: PathBuf,
+    hits: Vec<Hit>,
+    size: u64,
+}
+
+impl Queued {
+    fn new(recipe: Recipe, here: PathBuf, hits: Vec<Hit>) -> Queued {
+        let size = hits.iter().map(|h| h.size).sum();
+        Queued {
+            recipe,
+            here,
+            hits,
+            size,
+        }
+    }
+}
+
+/// `inner` is `outer` or lies inside it (paths relative to the scan root).
+fn within(inner: &[u8], outer: &[u8]) -> bool {
+    inner == outer
+        || (inner.len() > outer.len() && inner.starts_with(outer) && inner[outer.len()] == b'/')
+}
+
+/// The folders to rescan after running `dirs`: each once, minus those inside another.
+fn tops(mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    dirs.sort();
+    dirs.dedup();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !out.iter().any(|t| d.starts_with(t)) {
+            out.push(d);
+        }
+    }
+    out
 }
 
 enum Msg {
@@ -58,6 +105,8 @@ enum Msg {
         io::Result<db::Refreshed>,
         usize,
     ),
+    /// A queue run was stopped: the steps it did not reach go back in the queue.
+    Requeue(Vec<Queued>),
 }
 
 /// The result of a run, for the Done screen.
@@ -69,6 +118,8 @@ struct Outcome {
     after: u64,
     /// `x`: how many items of other people were left inside the removed folder.
     left: usize,
+    /// A queue run: sizes are for the whole scan, paths shown in full.
+    queue: bool,
 }
 
 /// `x`: the highlighted row being removed. `hit` is filled from the database refreshed in
@@ -309,6 +360,13 @@ pub struct App {
     step: (usize, usize, String),
     outcome: Option<Outcome>,
     del: Option<Del>,
+    /// Steps queued with `a`, in order; run with `Q`, then `r`.
+    queue: Vec<Queued>,
+    /// Queue view cursor.
+    qsel: usize,
+    /// The running (or last) run is the queue; `queue_before` is the scan's size before it.
+    queue_run: bool,
+    queue_before: u64,
 }
 
 /// True if `dir` lies inside a directory refreshed less than `secs` seconds ago.
@@ -360,6 +418,10 @@ impl App {
             step: (0, 0, String::new()),
             outcome: None,
             del: None,
+            queue: Vec::new(),
+            qsel: 0,
+            queue_run: false,
+            queue_before: 0,
         }
     }
 
@@ -891,17 +953,20 @@ impl App {
                 }
                 self.psel = (self.psel + 1).min(len.saturating_sub(1));
             }
-            KeyCode::Enter if self.ticked.0 == 0 => {
+            KeyCode::Enter | KeyCode::Char('a') if self.ticked.0 == 0 => {
                 self.status = "Tick at least one path to continue.".into();
             }
             KeyCode::Enter => self.mode = Mode::Confirm,
+            KeyCode::Char('a') => self.enqueue(),
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Menu,
             _ => {}
         }
     }
 
-    fn start_run(&mut self) {
-        let (recipe, hits) = if let Some(d) = &self.del {
+    /// The recipe and ticked hits a run or a queue step is made of: the `x` removal, or the
+    /// chosen recipe's ticked paths.
+    fn current_step(&self) -> (Recipe, Vec<Hit>) {
+        if let Some(d) = &self.del {
             // `x`: one hit with `here` = the folder shown, so the same guards apply.
             let name = d.target.file_name().unwrap_or_default().to_string_lossy();
             let r = Recipe {
@@ -922,42 +987,141 @@ impl App {
                 .map(|(h, _)| h.clone())
                 .collect();
             (r.clone(), hits)
+        }
+    }
+
+    fn start_run(&mut self) {
+        let (recipe, hits) = self.current_step();
+        let here = self.root.clone();
+        let del = self.del.as_ref().map(|d| d.target.clone());
+        let job = Queued::new(recipe, here.clone(), hits);
+        self.run_jobs(vec![job], vec![here], del, false);
+    }
+
+    /// `a`: queue the current step instead of running it. Paths already queued (or inside a
+    /// queued folder) are not added twice; queued paths inside a newly queued folder move
+    /// into it. Back to the menu to pick more (`x`: back to the folder).
+    fn enqueue(&mut self) {
+        let (recipe, hits) = self.current_step();
+        let name = recipe.name.clone();
+        let total = hits.len();
+        let hits: Vec<Hit> = hits
+            .into_iter()
+            .filter(|h| {
+                !self
+                    .queue
+                    .iter()
+                    .flat_map(|q| &q.hits)
+                    .any(|q| within(&h.path, &q.path) && (q.is_dir || q.path == h.path))
+            })
+            .collect();
+        for d in hits.iter().filter(|h| h.is_dir) {
+            for q in &mut self.queue {
+                q.hits.retain(|h| !within(&h.path, &d.path));
+                q.size = q.hits.iter().map(|h| h.size).sum();
+            }
+        }
+        self.queue.retain(|q| !q.hits.is_empty());
+        let added = hits.len();
+        let size: u64 = hits.iter().map(|h| h.size).sum();
+        if added > 0 {
+            self.queue
+                .push(Queued::new(recipe, self.root.clone(), hits));
+        }
+        let again = match total - added {
+            0 => String::new(),
+            n => format!(" ({} already queued)", n_paths(n)),
         };
+        self.status = format!(
+            "Queued {} ({}) from {name}{again}. Q in the folder view shows the queue.",
+            n_paths(added),
+            human(size)
+        );
+        if self.del.take().is_some() {
+            self.mode = Mode::List;
+        } else {
+            self.mode = Mode::Menu;
+        }
+    }
+
+    /// `r`, `y` in the queue: run every queued step in order, then rescan each folder once.
+    fn start_queue(&mut self) {
+        let jobs = std::mem::take(&mut self.queue);
+        let dirs = tops(jobs.iter().map(|q| q.here.clone()).collect());
+        self.queue_before = self
+            .db
+            .as_ref()
+            .and_then(|d| d.total_under(&self.scan_root).ok())
+            .unwrap_or(0);
+        self.del = None;
+        self.run_jobs(jobs, dirs, None, true);
+    }
+
+    /// `q` or ctrl-c: with steps still queued, ask first.
+    fn request_quit(&mut self) {
+        if self.queue.is_empty() || self.mode == Mode::QuitAsk {
+            self.quit = true;
+        } else {
+            self.mode = Mode::QuitAsk;
+        }
+    }
+
+    fn run_jobs(
+        &mut self,
+        jobs: Vec<Queued>,
+        refresh: Vec<PathBuf>,
+        del: Option<PathBuf>,
+        queue: bool,
+    ) {
         self.cancel = Arc::default();
-        self.step = (0, hits.len(), String::new());
+        let total: usize = jobs.iter().map(|j| j.hits.len()).sum();
+        self.step = (0, total, String::new());
         self.outcome = None;
+        self.queue_run = queue;
         self.mode = Mode::Running;
-        let (db, root, here, bin, threads) = (
+        let (db, root, bin, threads) = (
             self.db_path.clone(),
             self.scan_root.clone(),
-            self.root.clone(),
             self.bin.clone(),
             self.threads,
         );
         let cancel = self.cancel.clone();
-        let del = self.del.as_ref().map(|d| d.target.clone());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let total = hits.len();
-            let (mut done, mut problems) = (0, Vec::new());
-            apply::run(
-                &recipe,
-                &root,
-                &here,
-                &hits,
-                bin.as_deref(),
-                &cancel,
-                &mut |i, h, v| {
-                    if *v == Verdict::Done {
-                        done += 1;
-                    } else {
-                        problems.push((h.path.clone(), v.clone()));
-                    }
-                    let p = String::from_utf8_lossy(&h.path).into_owned();
-                    let _ = tx.send(Msg::Step(i + 1, total, p));
-                },
-            );
+            let (mut done, mut problems, mut back) = (0, Vec::new(), Vec::new());
+            let mut base = 0;
+            for j in &jobs {
+                let verdicts = apply::run(
+                    &j.recipe,
+                    &root,
+                    &j.here,
+                    &j.hits,
+                    bin.as_deref(),
+                    &cancel,
+                    &mut |i, h, v| {
+                        if *v == Verdict::Done {
+                            done += 1;
+                        } else {
+                            problems.push((h.path.clone(), v.clone()));
+                        }
+                        let p = String::from_utf8_lossy(&h.path).into_owned();
+                        let _ = tx.send(Msg::Step(base + i + 1, total, p));
+                    },
+                );
+                // Stopped with esc: what was not reached goes back in the queue.
+                let rest: Vec<Hit> = j
+                    .hits
+                    .iter()
+                    .zip(&verdicts)
+                    .filter(|(_, v)| matches!(v, Verdict::Skipped(w) if w == "cancelled"))
+                    .map(|(h, _)| h.clone())
+                    .collect();
+                if !rest.is_empty() {
+                    back.push(Queued::new(j.recipe.clone(), j.here.clone(), rest));
+                }
+                base += j.hits.len();
+            }
             let kept = |v: &Verdict| matches!(v, Verdict::Failed(w) if w.starts_with(OTHERS) || w.starts_with(MOUNT));
             let left = match &del {
                 Some(t) if problems.iter().any(|(_, v)| kept(v)) => {
@@ -965,7 +1129,10 @@ impl App {
                 }
                 _ => 0,
             };
-            let res = db::refresh(&db, &[here], threads, Arc::default());
+            let res = db::refresh(&db, &refresh, threads, Arc::default());
+            if queue && !back.is_empty() {
+                let _ = tx.send(Msg::Requeue(back));
+            }
             let _ = tx.send(Msg::Applied(done, problems, res, left));
         });
     }
@@ -988,7 +1155,7 @@ impl App {
             && key.code == KeyCode::Char('c')
             && self.mode != Mode::Running
         {
-            self.quit = true;
+            self.request_quit();
             return;
         }
         let code = key.code;
@@ -1008,8 +1175,15 @@ impl App {
                 match code {
                     KeyCode::Esc if !self.stack.is_empty() => self.go_up(),
                     KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h' | 'u') => self.go_up(),
-                    KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                    KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
                     KeyCode::Char('N') => self.want_ncdu = true,
+                    KeyCode::Char('Q') if self.queue.is_empty() => {
+                        self.status = "Nothing queued yet. In a recipe's path list, a queues instead of cleaning now.".into();
+                    }
+                    KeyCode::Char('Q') => {
+                        self.qsel = 0;
+                        self.mode = Mode::Queue;
+                    }
                     KeyCode::Char('c') if self.db.is_some() => self.start_clean(false),
                     KeyCode::Char('C') if self.db.is_some() => self.start_clean(true),
                     KeyCode::Char('x') if self.db.is_some() => self.start_remove(),
@@ -1034,6 +1208,7 @@ impl App {
             }
             Mode::Confirm => match code {
                 KeyCode::Char('y' | 'Y') => self.start_run(),
+                KeyCode::Char('a') => self.enqueue(),
                 KeyCode::Esc | KeyCode::Char('n' | 'q') if self.del.take().is_some() => {
                     self.mode = Mode::List;
                 }
@@ -1050,6 +1225,42 @@ impl App {
                 self.del = None;
                 self.mode = Mode::List;
             }
+            Mode::Queue => {
+                self.status.clear();
+                if let Some(n) = Self::step(self.qsel, self.queue.len(), code) {
+                    self.qsel = n;
+                    return;
+                }
+                match code {
+                    KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                        if self.qsel < self.queue.len() {
+                            let q = self.queue.remove(self.qsel);
+                            self.status = format!("Dropped {} from the queue.", q.recipe.name);
+                            self.qsel = self.qsel.min(self.queue.len().saturating_sub(1));
+                        }
+                        if self.queue.is_empty() {
+                            self.mode = Mode::List;
+                        }
+                    }
+                    KeyCode::Char('r') | KeyCode::Enter => self.mode = Mode::QueueConfirm,
+                    KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::List,
+                    _ => {}
+                }
+            }
+            Mode::QueueConfirm => match code {
+                KeyCode::Char('y' | 'Y') => self.start_queue(),
+                KeyCode::Esc | KeyCode::Char('n' | 'q') => self.mode = Mode::Queue,
+                _ => {}
+            },
+            Mode::QuitAsk => match code {
+                KeyCode::Char('r') => {
+                    self.qsel = 0;
+                    self.mode = Mode::Queue;
+                }
+                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Esc | KeyCode::Char('n') => self.mode = Mode::List,
+                _ => {}
+            },
         }
     }
 
@@ -1078,18 +1289,34 @@ impl App {
                 Msg::Refreshed(res) => self.on_refreshed(res),
                 Msg::Picked(i, res) => self.picks.push((i, res)),
                 Msg::Step(done, total, path) => self.step = (done, total, path),
+                Msg::Requeue(back) => {
+                    self.queue.splice(0..0, back);
+                }
                 Msg::Applied(done, problems, res, left) => {
                     self.rx = None;
-                    let before = self.total;
+                    let before = if self.queue_run {
+                        self.queue_before
+                    } else {
+                        self.total
+                    };
                     self.reopen();
+                    let after = if self.queue_run {
+                        self.db
+                            .as_ref()
+                            .and_then(|d| d.total_under(&self.scan_root).ok())
+                            .unwrap_or(0)
+                    } else {
+                        self.total
+                    };
                     self.status.clear();
                     self.outcome = Some(Outcome {
                         done,
                         problems,
                         rescan: res.err().map(|e| e.to_string()),
                         before,
-                        after: self.total,
+                        after,
                         left,
+                        queue: self.queue_run,
                     });
                     self.mode = Mode::Done;
                 }
@@ -1113,25 +1340,35 @@ impl App {
             ]
         };
         f.render_widget(Paragraph::new(lines), head);
+        let queued = match self.queue.len() {
+            0 => String::new(),
+            n => format!(" · Q queue ({n})"),
+        };
         let help = match self.mode {
-            Mode::Ask => "answer with the keys shown · q quit",
-            Mode::Scanning => "scanning — q quits and discards this scan",
-            Mode::List => {
-                "↑↓ move · enter open · ← back · c clean · C rescan & clean · x remove · N ncdu · q quit"
-            }
-            Mode::Refreshing => "esc back (the update finishes in the background)",
-            Mode::Menu => "↑↓ move · enter choose · esc back",
+            Mode::Ask => "answer with the keys shown · q quit".into(),
+            Mode::Scanning => "scanning — q quits and discards this scan".into(),
+            Mode::List => format!(
+                "↑↓ move · enter open · ← back · c clean · C rescan & clean · x remove · N ncdu{queued} · q quit"
+            ),
+            Mode::Refreshing => "esc back (the update finishes in the background)".into(),
+            Mode::Menu => "↑↓ move · enter choose · esc back".into(),
             Mode::Paths => {
-                "↑↓ move · space tick/untick · ctrl-a all/none · enter continue · esc back"
+                "↑↓ move · space tick/untick · ctrl-a all/none · enter continue · a queue · esc back"
+                    .into()
             }
-            Mode::Confirm if self.del.is_some() => "y yes, remove · n/esc cancel",
-            Mode::Confirm => "y yes, clean · n/esc back",
-            Mode::Running => "esc stop after the current path",
-            Mode::Done => "any key back to the folder",
+            Mode::Confirm if self.del.is_some() => {
+                "y yes, remove · a queue instead · n/esc cancel".into()
+            }
+            Mode::Confirm => "y yes, clean · a queue instead · n/esc back".into(),
+            Mode::Running => "esc stop after the current path".into(),
+            Mode::Done => "any key back to the folder".into(),
+            Mode::Queue => "↑↓ move · d drop step · r run all · esc back".into(),
+            Mode::QueueConfirm => "y yes, run them all · n/esc back".into(),
+            Mode::QuitAsk => "r review and run · q quit, dropping the queue · esc back".into(),
         };
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(help),
+                Line::from(help.as_str()),
                 Line::from(self.status.as_str()).yellow(),
             ]),
             foot,
@@ -1146,7 +1383,122 @@ impl App {
             Mode::Confirm => self.draw_confirm(f, body),
             Mode::Running => self.draw_running(f, body),
             Mode::Done => self.draw_done(f, body),
+            Mode::Queue => self.draw_queue(f, body),
+            Mode::QueueConfirm => self.draw_queue_confirm(f, body),
+            Mode::QuitAsk => self.draw_quit_ask(f, body),
         }
+    }
+
+    /// Where a queued step was picked, relative to the scan root.
+    fn folder_of(&self, here: &Path) -> String {
+        match here.strip_prefix(&self.scan_root) {
+            Ok(r) if r.as_os_str().is_empty() => "(top folder)".into(),
+            Ok(r) => r.display().to_string(),
+            Err(_) => here.display().to_string(),
+        }
+    }
+
+    fn queue_total(&self) -> (usize, u64) {
+        self.queue
+            .iter()
+            .fold((0, 0), |(n, s), q| (n + q.hits.len(), s + q.size))
+    }
+
+    fn draw_queue(&mut self, f: &mut Frame, area: Rect) {
+        let (n, size) = self.queue_total();
+        let title = format!(
+            " Queue: {}, {}, {} ",
+            plural(self.queue.len(), "step"),
+            n_paths(n),
+            human(size)
+        );
+        let rows: Vec<TRow> = self
+            .queue
+            .iter()
+            .map(|q| {
+                TRow::new([
+                    q.recipe.name.clone(),
+                    self.folder_of(&q.here),
+                    n_paths(q.hits.len()),
+                    amount(&q.recipe.apply, q.size),
+                ])
+            })
+            .collect();
+        let widths = [
+            Constraint::Min(20),
+            Constraint::Min(20),
+            Constraint::Length(14),
+            Constraint::Length(16),
+        ];
+        f.render_stateful_widget(
+            Table::new(rows, widths)
+                .block(Block::bordered().title(title))
+                .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("▶ "),
+            area,
+            &mut TableState::default().with_selected(Some(self.qsel)),
+        );
+    }
+
+    fn draw_queue_confirm(&self, f: &mut Frame, area: Rect) {
+        let (n, size) = self.queue_total();
+        let mut lines = vec![
+            Line::from(format!(
+                "Run all {}: {} ({})? This cannot be undone.",
+                plural(self.queue.len(), "queued step"),
+                n_paths(n),
+                human(size)
+            ))
+            .bold(),
+            Line::from("Every path is checked again just before it is touched."),
+            Line::from(""),
+        ];
+        for q in &self.queue {
+            lines.push(Line::from(format!(
+                "  {} in {}: {}",
+                q.recipe.name,
+                self.folder_of(&q.here),
+                n_paths(q.hits.len())
+            )));
+        }
+        if self.queue.iter().any(|q| q.here == self.scan_root) {
+            lines.push(Line::from(""));
+            lines.push(
+                Line::from("Some steps were picked in the top folder of the whole scan.")
+                    .bold()
+                    .red(),
+            );
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("[y] yes, run them all   [n] no, go back"));
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title(" Are you sure? ")),
+            area,
+        );
+    }
+
+    fn draw_quit_ask(&self, f: &mut Frame, area: Rect) {
+        let (n, size) = self.queue_total();
+        let lines = vec![
+            Line::from(format!(
+                "You have {} that did not run: {} ({}).",
+                plural(self.queue.len(), "queued step"),
+                n_paths(n),
+                human(size)
+            ))
+            .bold(),
+            Line::from("The queue is not saved: quitting now drops it."),
+            Line::from(""),
+            Line::from("[r] review and run it   [q] quit anyway   [esc] go back"),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title(" Quit? ")),
+            area,
+        );
     }
 
     fn spinner(&self) -> &'static str {
@@ -1418,8 +1770,9 @@ impl App {
             None => vec![
                 Line::from(match o.after.cmp(&o.before) {
                     std::cmp::Ordering::Less => format!(
-                        "Freed {} here (was {}, now {}).",
+                        "Freed {} {} (was {}, now {}).",
                         human(o.before - o.after),
+                        if o.queue { "in total" } else { "here" },
                         human(o.before),
                         human(o.after)
                     ),
@@ -1454,9 +1807,14 @@ impl App {
             lines.insert(
                 0,
                 Line::from(format!(
-                    "You stopped the run: {} {} not touched.",
+                    "You stopped the run: {} {} not touched{}.",
                     n_paths(stopped),
-                    if stopped == 1 { "was" } else { "were" }
+                    if stopped == 1 { "was" } else { "were" },
+                    if o.queue {
+                        " (they are back in the queue)"
+                    } else {
+                        ""
+                    }
                 ))
                 .bold(),
             );
@@ -1482,7 +1840,12 @@ impl App {
                 Verdict::Skipped(w) => ("skipped", w),
                 Verdict::Done => continue,
             };
-            lines.push(Line::from(format!("{what}: {}: {why}", self.rel_here(p))));
+            let shown = if o.queue {
+                String::from_utf8_lossy(p).into_owned()
+            } else {
+                self.rel_here(p)
+            };
+            lines.push(Line::from(format!("{what}: {shown}: {why}")));
         }
         if o.problems.len() > room {
             lines.push(Line::from(format!(

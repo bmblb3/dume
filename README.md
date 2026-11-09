@@ -31,6 +31,12 @@ Press `c` to clean the **current folder** (so go into your case or project folde
    `ctrl-a` ticks all/none.
 3. Confirm with `y`, and it runs. At the end it shows how much was freed.
 
+**Queue instead of running.** Press `a` (in the path list, on the confirm screen, or at `x`) to queue the
+step instead of running it, then carry on picking in other folders. `Q` shows the queue: `d` drops a step,
+`r` then `y` runs them all, in order, with the same checks as a direct run. A path already queued is not
+queued twice. If you stop a queue run with `esc`, what it did not reach goes back in the queue. The queue
+lives only while dume runs: quitting with steps queued asks first.
+
 **Everything is permanent**: there is no undo. Read the path list before confirming.
 
 `N` opens everything in ncdu (an admin tool, optional).

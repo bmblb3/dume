@@ -1080,7 +1080,7 @@ fn x_confirm_shows_path_count_and_warning_text() {
         "{s}"
     );
     assert!(
-        s.contains("y yes, remove · n/esc cancel") && !s.contains("clean"),
+        s.contains("y yes, remove · a queue instead · n/esc cancel") && !s.contains("clean"),
         "{s}"
     );
 }
@@ -1389,4 +1389,172 @@ fn c_says_the_list_comes_from_the_saved_scan_and_capital_c_does_not() {
     key(&mut a, KeyCode::Char('c'));
     let s = settle(&mut a);
     assert!(!s.contains("Listed from your saved scan"), "{s}");
+}
+
+/// From the menu: choose the first recipe, then `a` to queue its ticked paths.
+fn queue_first_recipe(a: &mut App) -> String {
+    key(a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Paths);
+    key(a, KeyCode::Char('a'));
+    assert_eq!(a.mode, Mode::Menu, "a returns to the menu to pick more");
+    a.status.clone()
+}
+
+#[test]
+fn a_queues_instead_of_cleaning_and_q_runs_the_queue() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    let st = queue_first_recipe(&mut a);
+    assert!(st.contains("Queued 6 paths"), "{st}");
+    assert!(
+        big_paths(&e).iter().all(|p| p.exists()),
+        "queueing removes nothing"
+    );
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+    assert!(screen(&mut a).contains("Q queue (1)"));
+
+    key(&mut a, KeyCode::Char('Q'));
+    assert_eq!(a.mode, Mode::Queue);
+    let s = screen(&mut a);
+    assert!(s.contains("Time steps") && s.contains("6 paths"), "{s}");
+    key(&mut a, KeyCode::Char('r'));
+    assert_eq!(a.mode, Mode::QueueConfirm);
+    assert!(screen(&mut a).contains("cannot be undone"));
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Done, "{s}");
+    assert!(s.contains("Freed") && s.contains("6 done"), "{s}");
+    assert!(big_paths(&e).iter().all(|p| !p.exists()));
+    key(&mut a, KeyCode::Enter);
+    assert!(
+        !screen(&mut a).contains("Q queue ("),
+        "the queue is empty after running"
+    );
+}
+
+#[test]
+fn queueing_the_same_paths_twice_adds_nothing() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    queue_first_recipe(&mut a);
+    let st = queue_first_recipe(&mut a);
+    assert!(st.contains("already queued"), "{st}");
+    key(&mut a, KeyCode::Esc);
+    assert!(screen(&mut a).contains("Q queue (1)"));
+}
+
+#[test]
+fn a_queued_folder_absorbs_queued_paths_inside_it() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    queue_first_recipe(&mut a); // proj/case_*/100 and 200
+    key(&mut a, KeyCode::Esc);
+    highlight(&mut a, &e, "proj", "case_1");
+    ask_remove(&mut a);
+    key(&mut a, KeyCode::Char('a'));
+    assert_eq!(a.mode, Mode::List);
+    assert!(e.root.join("proj/case_1").exists());
+    key(&mut a, KeyCode::Char('Q'));
+    let s = screen(&mut a);
+    // case_1's two time steps moved into the removal of case_1 itself.
+    assert!(s.contains("4 paths") && s.contains("Remove case_1"), "{s}");
+    key(&mut a, KeyCode::Char('r'));
+    key(&mut a, KeyCode::Char('y'));
+    let s = settle(&mut a);
+    assert!(s.contains("5 done") && s.contains("0 failed"), "{s}");
+    assert!(!e.root.join("proj/case_1").exists());
+    assert!(!e.root.join("proj/case_2/100/big").exists());
+    assert!(e.root.join("proj/case_2/extra").exists());
+}
+
+#[test]
+fn quitting_with_a_queue_asks_first() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    queue_first_recipe(&mut a);
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('q'));
+    assert_eq!(a.mode, Mode::QuitAsk);
+    assert!(!a.quit);
+    assert!(screen(&mut a).contains("1 queued step"));
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+    ctrl(&mut a, 'c');
+    assert_eq!(a.mode, Mode::QuitAsk, "ctrl-c asks too");
+    key(&mut a, KeyCode::Char('r'));
+    assert_eq!(a.mode, Mode::Queue, "r goes to the queue to review and run");
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('q'));
+    key(&mut a, KeyCode::Char('q'));
+    assert!(a.quit, "q at the question quits, dropping the queue");
+    assert!(big_paths(&e).iter().all(|p| p.exists()));
+}
+
+#[test]
+fn d_drops_a_queued_step() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    queue_first_recipe(&mut a);
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('Q'));
+    key(&mut a, KeyCode::Char('d'));
+    assert_eq!(
+        a.mode,
+        Mode::List,
+        "the last step dropped: back to the folder"
+    );
+    key(&mut a, KeyCode::Char('q'));
+    assert!(a.quit, "nothing queued: q quits at once");
+}
+
+#[test]
+fn queue_from_the_confirm_screen_too() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Confirm);
+    key(&mut a, KeyCode::Char('a'));
+    assert_eq!(a.mode, Mode::Menu);
+    assert!(a.status.contains("Queued 6 paths"), "{}", a.status);
+}
+
+#[test]
+fn stopping_a_queue_run_puts_what_it_did_not_reach_back() {
+    let e = env();
+    // Slow enough that esc lands while the first file is being handled.
+    let r = recipes(
+        &e,
+        &[
+            ("slow.sh", "#!/bin/sh\nsleep 0.5\n"),
+            (
+                "s.sql",
+                "-- dume-name: Slow\n-- dume-apply: slow.sh\nSELECT path FROM entries WHERE name REGEXP '^big$'",
+            ),
+        ],
+    );
+    let mut a = app_with(&e, "proj", r);
+    menu(&mut a);
+    queue_first_recipe(&mut a);
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('Q'));
+    key(&mut a, KeyCode::Char('r'));
+    key(&mut a, KeyCode::Char('y'));
+    assert_eq!(a.mode, Mode::Running);
+    key(&mut a, KeyCode::Esc);
+    let s = settle(&mut a);
+    assert!(s.contains("back in the queue"), "{s}");
+    key(&mut a, KeyCode::Enter);
+    key(&mut a, KeyCode::Char('Q'));
+    assert_eq!(a.mode, Mode::Queue);
+    let s = screen(&mut a);
+    // At most the path in progress ran; the other five (or six) are queued again.
+    assert!(s.contains("5 paths") || s.contains("6 paths"), "{s}");
 }
