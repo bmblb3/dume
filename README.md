@@ -25,7 +25,8 @@ removes it (files of other people inside are left alone), `n` or `esc` cancels.
 
 Press `c` to clean the **current folder** (so go into your case or project folder first):
 
-1. dume rescans that folder, then shows what can be cleaned there, with sizes.
+1. dume shows what can be cleaned there, with sizes, from the database as it is (fast, no rescan).
+   Files created since the last scan are not listed; press `C` instead to rescan the folder first.
 2. Pick one; you get the full list of paths, everything ticked by default. `space` unticks,
    `ctrl-a` ticks all/none.
 3. Confirm with `y`, and it runs. At the end it shows how much was freed.
@@ -91,7 +92,7 @@ STAR-CCM+ and ANSA examples are placeholders that fail until you fill in the `TO
 | `root` | required | absolute path everyone scans |
 | `threads` | 32 | concurrent stats per scan; lower it if many people scan at once |
 | `stale_days` | 7 | warn when a scan is older |
-| `rescan_skip_secs` | 300 | `c` skips the rescan of a folder (re)scanned this recently in the session; 0 = always rescan |
+| `rescan_skip_secs` | 300 | `C` skips the rescan of a folder (re)scanned this recently in the session; 0 = always rescan |
 | `prune` | `[]` | directory-name globs (`*` `?` `[..]`, matched at any depth) that are walked for their size but not stored, e.g. `[".git", ".venv", "processor[0-9]*"]` |
 
 Unknown keys are errors.

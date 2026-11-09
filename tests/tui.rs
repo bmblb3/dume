@@ -437,7 +437,7 @@ fn settle(a: &mut App) -> String {
 
 /// `c`, then wait for the menu.
 fn menu(a: &mut App) -> String {
-    key(a, KeyCode::Char('c'));
+    key(a, KeyCode::Char('C'));
     assert_eq!(a.mode, Mode::Refreshing);
     let s = settle(a);
     assert_eq!(a.mode, Mode::Menu, "status: {}\n{s}", a.status);
@@ -455,7 +455,7 @@ fn big_paths(e: &Env) -> Vec<PathBuf> {
 }
 
 #[test]
-fn c_rescans_then_shows_menu_with_counts() {
+fn capital_c_rescans_then_shows_menu_with_counts() {
     let e = env();
     fs::write(e.root.join("proj/case_1/run.log"), vec![1u8; 8192]).unwrap();
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG, LOGS]));
@@ -676,7 +676,7 @@ fn esc_during_refresh_cancels_and_keeps_db() {
     let e = env();
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
     fs::write(e.root.join("proj/late.txt"), b"late").unwrap();
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     assert_eq!(a.mode, Mode::Refreshing);
     key(&mut a, KeyCode::Esc);
     assert_eq!(a.mode, Mode::List);
@@ -698,7 +698,7 @@ fn esc_during_refresh_cancels_and_keeps_db() {
 
     // Another writer holds the lock: a plain message, back in Where.
     let lock = db::lock_writer(&e.db).unwrap();
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     let s = settle(&mut a);
     assert_eq!(a.mode, Mode::List, "{s}");
     assert!(
@@ -726,7 +726,7 @@ fn deleted_here_returns_to_where_with_message() {
     key(&mut a, KeyCode::Enter);
     assert_eq!(a.root, e.root.join("proj/case_3"));
     fs::remove_dir_all(e.root.join("proj/case_3")).unwrap();
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     let s = settle(&mut a);
     assert_eq!(a.mode, Mode::List, "{s}");
     assert_eq!(a.root, e.root.join("proj"));
@@ -740,7 +740,7 @@ fn deleted_here_returns_to_where_with_message() {
     assert_ne!(here, e.root.join("proj"));
     fs::remove_dir_all(&here).unwrap();
     fs::write(&here, "now a file").unwrap();
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     settle(&mut a);
     assert_eq!(a.mode, Mode::List);
     assert_eq!(a.root, e.root.join("proj"));
@@ -756,14 +756,14 @@ fn footer_shows_keys_for_each_mode() {
         "↑↓ move",
         "enter open",
         "← back",
-        "c clean this folder",
+        "C rescan & clean",
         "x remove",
         "N ncdu",
         "q quit",
     ] {
         assert!(s.contains(k), "Where footer lacks {k}: {s}");
     }
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     assert!(screen(&mut a).contains("esc back"));
     let s = settle(&mut a);
     assert!(s.contains("enter choose") && s.contains("esc back"), "{s}");
@@ -838,7 +838,7 @@ fn cannot_start_a_clean_while_recipes_are_still_being_checked() {
     // and recipe results only change inside `tick`, so `busy()` below is exact.
     let sl = slow(6_000_000);
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG, ("slow.sql", &sl)]));
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     // Wait for the first recipe while the slow one is still running.
     let t = Instant::now();
     while !(a.mode == Mode::Menu && screen(&mut a).contains("Time steps")) {
@@ -1193,7 +1193,7 @@ fn x_esc_then_c_shows_the_menu_not_a_stale_remove() {
     let e = env();
     let mut a = app_with(&e, "proj", vec![]);
     x_esc_unseen(&mut a, &e, "case_1");
-    key(&mut a, KeyCode::Char('c'));
+    key(&mut a, KeyCode::Char('C'));
     let s = settle(&mut a);
     assert_eq!(a.mode, Mode::Menu, "{s}");
     assert!(!s.contains("Remove "), "{s}");
@@ -1305,5 +1305,69 @@ fn x_done_text_for_what_was_left() {
     assert_eq!(
         tui::removed_text(p, &f("contains a mount point: scratch"), 2),
         "Removed everything of yours on this disk; left another disk mounted inside it: scratch; also left 2 items that belong to other people."
+    );
+}
+
+#[test]
+fn c_cleans_from_the_database_without_rescanning() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    fs::write(e.root.join("proj/case_1/run.log"), vec![1u8; 8192]).unwrap();
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert!(s.contains("Time steps") && s.contains("6 paths"), "{s}");
+    // No refresh: the database still does not know about the new file.
+    assert!(
+        Db::open_ro(&e.db)
+            .unwrap()
+            .children(&e.root.join("proj/case_1"))
+            .unwrap()
+            .iter()
+            .all(|c| c.name != b"run.log")
+    );
+    key(&mut a, KeyCode::Esc);
+    assert_eq!(a.mode, Mode::List);
+    // C refreshes first, so the same file is now in the database.
+    key(&mut a, KeyCode::Char('C'));
+    settle(&mut a);
+    assert!(
+        Db::open_ro(&e.db)
+            .unwrap()
+            .children(&e.root.join("proj/case_1"))
+            .unwrap()
+            .iter()
+            .any(|c| c.name == b"run.log")
+    );
+}
+
+#[test]
+fn c_does_not_mark_the_folder_fresh_so_capital_c_still_rescans() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    key(&mut a, KeyCode::Char('c'));
+    settle(&mut a);
+    key(&mut a, KeyCode::Esc);
+    fs::write(e.root.join("proj/case_1/late.txt"), vec![1u8; 4096]).unwrap();
+    // With rescan_skip_secs = 300, a C right after a c must still refresh the folder.
+    key(&mut a, KeyCode::Char('C'));
+    settle(&mut a);
+    assert!(
+        Db::open_ro(&e.db)
+            .unwrap()
+            .children(&e.root.join("proj/case_1"))
+            .unwrap()
+            .iter()
+            .any(|c| c.name == b"late.txt")
+    );
+}
+
+#[test]
+fn where_footer_lists_both_clean_keys() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    let s = screen(&mut a);
+    assert!(
+        s.contains("c clean ·") && s.contains("C rescan & clean"),
+        "{s}"
     );
 }

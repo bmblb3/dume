@@ -592,7 +592,8 @@ impl App {
 
     /// `c`: rescan `root`, then run every recipe on the refreshed database, in one worker,
     /// so the hits can only come from a database refreshed for this directory just now.
-    fn start_clean(&mut self) {
+    /// `C` (`rescan`) does that; `c` runs the recipes on the database as it is, without a rescan.
+    fn start_clean(&mut self, rescan: bool) {
         self.del = None;
         self.progress = Arc::default();
         self.scan_started = Instant::now();
@@ -606,8 +607,9 @@ impl App {
             self.progress.clone(),
         );
         let recipes = self.recipes.clone();
-        let skip = is_fresh(&self.fresh, &here, self.rescan_skip_secs);
-        self.refreshing = Some(here.clone());
+        let skip = !rescan || is_fresh(&self.fresh, &here, self.rescan_skip_secs);
+        // Only a real rescan marks the folder as fresh (see on_refreshed).
+        self.refreshing = rescan.then(|| here.clone());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
@@ -980,7 +982,8 @@ impl App {
                     KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h' | 'u') => self.go_up(),
                     KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
                     KeyCode::Char('N') => self.want_ncdu = true,
-                    KeyCode::Char('c') if self.db.is_some() => self.start_clean(),
+                    KeyCode::Char('c') if self.db.is_some() => self.start_clean(false),
+                    KeyCode::Char('C') if self.db.is_some() => self.start_clean(true),
                     KeyCode::Char('x') if self.db.is_some() => self.start_remove(),
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_dir(),
                     _ => {}
@@ -1086,7 +1089,7 @@ impl App {
             Mode::Ask => "answer with the keys shown · q quit",
             Mode::Scanning => "scanning — q quits and discards this scan",
             Mode::List => {
-                "↑↓ move · enter open · ← back · c clean this folder · x remove · N ncdu · q quit"
+                "↑↓ move · enter open · ← back · c clean · C rescan & clean · x remove · N ncdu · q quit"
             }
             Mode::Refreshing => "esc back (the update finishes in the background)",
             Mode::Menu => "↑↓ move · enter choose · esc back",
