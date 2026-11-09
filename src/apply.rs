@@ -240,8 +240,18 @@ fn empty(
             names.push(OsString::from_vec(n));
         }
     }
+    // Something else may remove entries meanwhile (a solver tidying up): what is already
+    // gone needs no deleting, so ENOENT on an entry is not an error.
+    let gone = |r: Result<(), Errno>| match r {
+        Err(Errno::NOENT) => Ok(()),
+        r => r,
+    };
     for name in names {
-        let mut st: Stat = rustix::fs::statat(fd, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let mut st: Stat = match rustix::fs::statat(fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e),
+        };
         fix(&name, &mut st);
         let path = at.join(&name);
         if st.st_uid != c.me {
@@ -249,7 +259,7 @@ fn empty(
             continue;
         }
         if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
-            rustix::fs::unlinkat(fd, &name, AtFlags::empty())?;
+            gone(rustix::fs::unlinkat(fd, &name, AtFlags::empty()))?;
             continue;
         }
         if st.st_dev as u64 != c.dev {
@@ -257,10 +267,14 @@ fn empty(
             continue;
         }
         let before = kept.mounts.len() + kept.theirs.len();
-        let sub = rustix::fs::openat(fd, &name, DIR, Mode::empty())?;
+        let sub = match rustix::fs::openat(fd, &name, DIR, Mode::empty()) {
+            Ok(sub) => sub,
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e),
+        };
         empty(&sub, c, &path, kept, fix, depth + 1)?;
         if kept.mounts.len() + kept.theirs.len() == before {
-            rustix::fs::unlinkat(fd, &name, AtFlags::REMOVEDIR)?;
+            gone(rustix::fs::unlinkat(fd, &name, AtFlags::REMOVEDIR))?;
         }
     }
     Ok(())

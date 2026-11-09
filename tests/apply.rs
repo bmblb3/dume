@@ -465,3 +465,32 @@ fn double_slash_in_hit_path_is_normalised_or_refused() {
     assert!(!here.join("f").exists() && !here.join("g").exists());
     assert!(root.join("x").exists());
 }
+
+/// Something else (a solver tidying up, a second dume) removes entries while a folder is
+/// being emptied. Gone is gone: the delete still finishes.
+#[test]
+fn entries_vanishing_mid_delete_do_not_abort_it() {
+    let (_t, root, here) = tree();
+    for n in ["a", "b", "c", "early", "gone_file"] {
+        put(&here.join("d").join(n));
+    }
+    put(&here.join("d/gone_dir/x"));
+    let c = check(&root, &here, &hit(&root, "h/d")).unwrap();
+    let d = here.join("d");
+    let first = std::cell::Cell::new(true);
+    let v = delete(&c, &|name, _| {
+        // After the listing: `early` vanishes before its own stat (unless it is first).
+        if first.replace(false) && name != "early" {
+            let _ = fs::remove_file(d.join("early"));
+        }
+        // Right after their stat: these vanish before the unlink / open.
+        if name == "gone_file" {
+            fs::remove_file(d.join("gone_file")).unwrap();
+        }
+        if name == "gone_dir" {
+            fs::remove_dir_all(d.join("gone_dir")).unwrap();
+        }
+    });
+    assert_eq!(v, Verdict::Done);
+    assert!(!d.exists());
+}
