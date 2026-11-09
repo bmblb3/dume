@@ -66,7 +66,64 @@ fn failed_scan_keeps_old_db() {
         .is_err()
     );
     assert_eq!(std::fs::read(&dbp).unwrap(), before);
-    assert!(!t.path().join(".dume.db.tmp").exists());
+    assert!(!dumelib::db::tmp_path(&dbp).exists());
+}
+
+/// A tree with enough files that a refresh writes several pages.
+fn many_files(t: &Path, n: usize) -> std::path::PathBuf {
+    let root = t.join("r");
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    for i in 0..n {
+        write(&root.join(format!("d/f{i}")), 10);
+    }
+    root
+}
+
+/// What a writer killed mid-transaction leaves: `dst` plus a journal no process holds.
+/// The transaction is kept open on `src` while both files are copied.
+fn crashed_copy(src: &Path, dst: &Path) {
+    let c = rusqlite::Connection::open(src).unwrap();
+    c.execute_batch(
+        "PRAGMA cache_size=1; BEGIN; UPDATE entries SET asize = asize + 1, dsize = dsize + 7;",
+    )
+    .unwrap();
+    let journal = dumelib::db::journal_path(src);
+    assert!(journal.exists(), "the open transaction has a journal");
+    std::fs::copy(src, dst).unwrap();
+    std::fs::copy(&journal, dumelib::db::journal_path(dst)).unwrap();
+    c.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn interrupted_update_is_named_and_a_rescan_recovers() {
+    let t = tempfile::tempdir().unwrap();
+    let root = many_files(t.path(), 300);
+    let good = t.path().join("good.db");
+    scan_to_db(&root, &good, uid(), 1, Default::default()).unwrap();
+    let dbp = t.path().join("dume.db");
+    crashed_copy(&good, &dbp);
+
+    // Every read-only open fails while the journal is there; say why, not "older dume".
+    let e = Db::open_ro(&dbp).err().unwrap().to_string();
+    assert!(e.contains("interrupted"), "{e}");
+    assert!(!e.contains("older dume"), "{e}");
+
+    // A full rescan replaces the file and drops the journal that belonged to the old one.
+    scan_to_db(&root, &dbp, uid(), 1, Default::default()).unwrap();
+    assert!(!dumelib::db::journal_path(&dbp).exists());
+    let db = Db::open_ro(&dbp).unwrap();
+    assert_eq!(
+        db.total_under(&root).unwrap(),
+        Db::open_ro(&good).unwrap().total_under(&root).unwrap()
+    );
+}
+
+#[test]
+fn tmp_file_is_per_database() {
+    let p = |s: &str| dumelib::db::tmp_path(Path::new(s));
+    assert_eq!(p("/s/dume.db"), Path::new("/s/.dume.db.tmp"));
+    assert_eq!(p("/var/tmp/alice.db"), Path::new("/var/tmp/.alice.db.tmp"));
+    assert_ne!(p("/var/tmp/alice.db"), p("/var/tmp/bob.db"));
 }
 
 #[test]

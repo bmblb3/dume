@@ -13,22 +13,69 @@
 //! A partial index on `ino` (nlink>1 rows) serves hardlink lookups in `refresh`.
 //! `import_json` builds the same schema from an old `dume.json` (mtime NULL).
 //!
-//! A scan is built in a sibling `.dume.db.tmp` in one transaction, then renamed
-//! over the target, so readers see either the old or the new database.
+//! A scan is built in a sibling `.<name>.tmp` (see [`tmp_path`]) in one transaction,
+//! then renamed over the target, so readers see either the old or the new database.
+//!
+//! A write killed mid-transaction leaves `<db>-journal` behind. While it is there every
+//! read-only open fails, and replaying it into a different (rebuilt) file would write
+//! old pages into it. So a rebuild removes the journal of the file it replaces, and
+//! [`writing`] lets the TUI wait for in-place writes instead of killing them on quit.
 
 use crate::json;
 use crate::merge;
 use crate::scan::{DirView, FileRec, Progress, Prune, Scan, scan_pruned};
 use rusqlite::{Connection, OpenFlags, params};
 use rustix::fs::{FlockOperation, flock};
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e)
+}
+
+/// The temporary file a full scan of `db` is built in: `.<name>.tmp` beside it, so two
+/// databases in one directory (`DUME_DB=/var/tmp/$USER.db`) never share it.
+pub fn tmp_path(db: &Path) -> PathBuf {
+    let mut n = OsString::from(".");
+    n.push(db.file_name().unwrap_or("dume.db".as_ref()));
+    n.push(".tmp");
+    db.with_file_name(n)
+}
+
+/// SQLite's rollback journal for the database file `p`.
+pub fn journal_path(p: &Path) -> PathBuf {
+    let mut n = p.as_os_str().to_owned();
+    n.push("-journal");
+    PathBuf::from(n)
+}
+
+/// In-place writes ([`refresh`]) running in this process.
+static WRITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// True while a [`refresh`] in this process may be writing the database. Exiting then
+/// would kill it mid-transaction and leave a journal behind.
+pub fn writing() -> bool {
+    WRITERS.load(Ordering::SeqCst) > 0
+}
+
+struct Writing;
+
+impl Writing {
+    fn start() -> Writing {
+        WRITERS.fetch_add(1, Ordering::SeqCst);
+        Writing
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        WRITERS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub struct Db {
@@ -106,6 +153,13 @@ fn check_schema(c: &Connection) -> io::Result<()> {
         ) if m == "no such column: files" => Err(io::Error::other(
             "this scan was made by an older dume; scan again",
         )),
+        // SQLITE_READONLY_ROLLBACK: a journal from an interrupted write is in the way.
+        Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == 776 => {
+            Err(io::Error::other(
+                "the last update of this scan was interrupted (dume was stopped while \
+                 writing it); scan again",
+            ))
+        }
         Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
             Err(io::Error::other(
                 "the scan is locked: another dume is updating it, or file locking does \
@@ -262,14 +316,24 @@ pub struct Entry {
 /// previous database survives any failure. Takes the writer lock.
 fn atomic(db: &Path, make: impl FnOnce(&Path) -> io::Result<u64>) -> io::Result<u64> {
     let _lock = lock_writer(db)?;
-    let tmp = db.with_file_name(".dume.db.tmp");
+    let tmp = tmp_path(db);
+    // A killed earlier build may have left its journal too. SQLite ignores a journal next
+    // to an empty file, so this is only tidying.
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(journal_path(&tmp));
     let r = make(&tmp).and_then(|n| {
         std::fs::rename(&tmp, db)?;
+        // The journal of the file just replaced (an interrupted refresh) belongs to
+        // nothing now. Under the writer lock no write is in progress, so it is stale.
+        match std::fs::remove_file(journal_path(db)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         Ok(n)
     });
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(journal_path(&tmp));
     }
     r
 }
@@ -784,6 +848,7 @@ pub fn refresh(
     threads: usize,
     progress: Arc<Progress>,
 ) -> io::Result<Refreshed> {
+    let _writing = Writing::start();
     let _lock = lock_writer(db)?;
     let mut conn =
         Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(err)?;

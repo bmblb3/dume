@@ -122,6 +122,23 @@ fn run(cli: &Cli) -> Result<(), String> {
                 }
             }
         }
+        // Exiting now would kill a background update of the database mid-write, leaving a
+        // journal that makes the scan unreadable until a full rescan. Wait for it instead.
+        while dumelib::db::writing() {
+            term.draw(|f| {
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(
+                        "Finishing the update of your scan before quitting.\n\
+                         This can take a while on a big folder; it can't be interrupted safely.",
+                    ),
+                    f.area(),
+                )
+            })?;
+            // Keys pressed meanwhile are read and dropped.
+            if event::poll(Duration::from_millis(100))? {
+                let _ = event::read()?;
+            }
+        }
         Ok(())
     })();
     ratatui::restore();

@@ -458,7 +458,9 @@ impl App {
     /// Remove the half-written scan file if we quit mid-scan.
     pub fn cleanup(&self) {
         if self.mode == Mode::Scanning {
-            let _ = std::fs::remove_file(self.db_path.with_file_name(".dume.db.tmp"));
+            let tmp = db::tmp_path(&self.db_path);
+            let _ = std::fs::remove_file(db::journal_path(&tmp));
+            let _ = std::fs::remove_file(tmp);
         }
     }
 

@@ -387,7 +387,7 @@ fn merge_rejects_bad_inputs_and_leaves_file_alone() {
     assert_eq!(merge(t.path(), &out.path().join("none.json"), &[]).0, 1);
 
     assert_eq!(fs::read(&f).unwrap(), before);
-    assert!(!out.path().join(".dume.db.tmp").exists());
+    assert!(!out.path().join(".me.db.tmp").exists());
 }
 
 #[test]
