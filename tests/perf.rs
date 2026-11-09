@@ -68,7 +68,7 @@ fn scan_and_query_a_million_entries() {
         println!("rows: {n}");
     }
     tx.execute_batch(
-        "CREATE INDEX entries_parent ON entries(parent); CREATE INDEX entries_name ON entries(name); CREATE INDEX entries_ino ON entries(ino) WHERE nlink>1;",
+        "CREATE INDEX entries_parent_name ON entries(parent, name); CREATE INDEX entries_name ON entries(name); CREATE INDEX entries_dir_name ON entries(name) WHERE is_dir = 1; CREATE INDEX entries_ino ON entries(ino) WHERE nlink>1;",
     )
     .unwrap();
     {

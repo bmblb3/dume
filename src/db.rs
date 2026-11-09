@@ -525,7 +525,7 @@ fn write_db(
     let tx = conn.transaction().map_err(err)?;
     {
         plan.insert(&tx)?;
-        tx.execute_batch("CREATE INDEX entries_parent ON entries(parent); CREATE INDEX entries_name ON entries(name); CREATE INDEX entries_ino ON entries(ino) WHERE nlink>1;")
+        tx.execute_batch("CREATE INDEX entries_parent_name ON entries(parent, name); CREATE INDEX entries_name ON entries(name); CREATE INDEX entries_dir_name ON entries(name) WHERE is_dir = 1; CREATE INDEX entries_ino ON entries(ino) WHERE nlink>1;")
             .map_err(err)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
