@@ -279,6 +279,8 @@ pub struct App {
     fresh: Vec<(PathBuf, Instant)>,
     /// The directory the running refresh covers.
     refreshing: Option<PathBuf>,
+    /// Set when `c` lists from the saved scan without rescanning: says how old it is.
+    saved_note: Option<String>,
     ask: Ask,
     progress: Arc<Progress>,
     scan_started: Instant,
@@ -337,6 +339,7 @@ impl App {
             prune: Vec::new(),
             fresh: Vec::new(),
             refreshing: None,
+            saved_note: None,
             ask: Ask::NoExport,
             progress: Arc::default(),
             scan_started: Instant::now(),
@@ -609,7 +612,30 @@ impl App {
             self.progress.clone(),
         );
         let recipes = self.recipes.clone();
-        let skip = !rescan || is_fresh(&self.fresh, &here, self.rescan_skip_secs);
+        let fresh = is_fresh(&self.fresh, &here, self.rescan_skip_secs);
+        let skip = !rescan || fresh;
+        // Without a rescan, sizes and folder hits come from the saved scan: say how old.
+        // (Files are re-checked at delete time; folders are removed as they are on disk.)
+        self.saved_note = (!rescan && !fresh).then(|| {
+            let age = self
+                .db
+                .as_ref()
+                .and_then(|d| d.meta().ok())
+                .map(|m| SystemTime::UNIX_EPOCH + Duration::from_secs(m.scanned))
+                .and_then(|t| SystemTime::now().duration_since(t).ok());
+            match age {
+                Some(a) => {
+                    let when = match age_text(a) {
+                        t if a.as_secs() < 60 => t,
+                        t => format!("{t} ago"),
+                    };
+                    format!(
+                        "Listed from your saved scan (full scan {when}). Esc, then C, rescans this folder first."
+                    )
+                }
+                None => "Listed from your saved scan. Esc, then C, rescans this folder first.".into(),
+            }
+        });
         // Only a real rescan marks the folder as fresh (see on_refreshed).
         self.refreshing = rescan.then(|| here.clone());
         let (tx, rx) = mpsc::channel();
@@ -1198,6 +1224,9 @@ impl App {
             .collect();
         // Failures are spelled out below the rows, one line each, and cannot be chosen.
         let mut notes: Vec<Line> = Vec::new();
+        if let Some(n) = &self.saved_note {
+            notes.push(Line::from(n.clone()).style(dim));
+        }
         if shown.is_empty() && !busy {
             notes.push(Line::from("Nothing to clean here.").bold());
             notes.push(Line::from(

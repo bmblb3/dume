@@ -1371,3 +1371,22 @@ fn where_footer_lists_both_clean_keys() {
         "{s}"
     );
 }
+
+#[test]
+fn c_says_the_list_comes_from_the_saved_scan_and_capital_c_does_not() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert!(s.contains("Listed from your saved scan"), "{s}");
+    assert!(s.contains("(full scan just now)"), "{s}");
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('C'));
+    let s = settle(&mut a);
+    assert!(!s.contains("Listed from your saved scan"), "{s}");
+    // Inside the rescan window, c lists fresh data: no note either.
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert!(!s.contains("Listed from your saved scan"), "{s}");
+}
