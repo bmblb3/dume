@@ -13,6 +13,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph, Row as TRow, Table, TableState, Wrap};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -69,10 +70,52 @@ impl Queued {
     }
 }
 
-/// `inner` is `outer` or lies inside it (paths relative to the scan root).
-fn within(inner: &[u8], outer: &[u8]) -> bool {
-    inner == outer
-        || (inner.len() > outer.len() && inner.starts_with(outer) && inner[outer.len()] == b'/')
+/// `p` lies strictly inside one of `dirs` (paths relative to the scan root): one lookup per
+/// parent folder of `p`, whatever the size of `dirs`.
+fn inside_any(p: &[u8], dirs: &HashSet<&[u8]>) -> bool {
+    !dirs.is_empty()
+        && p.iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'/' && dirs.contains(&p[..i]))
+}
+
+/// Keep the `hits` not queued yet: not a queued path, not inside a queued folder. Queued
+/// paths inside a newly kept folder move into it (they are dropped from their step). Cost:
+/// one pass over the queue plus a few set lookups per path, so `a` stays instant with
+/// millions of queued paths.
+fn merge_new(queue: &mut Vec<Queued>, hits: Vec<Hit>) -> Vec<Hit> {
+    let hits: Vec<Hit> = {
+        let all: HashSet<&[u8]> = queue
+            .iter()
+            .flat_map(|q| &q.hits)
+            .map(|h| h.path.as_slice())
+            .collect();
+        let dirs: HashSet<&[u8]> = queue
+            .iter()
+            .flat_map(|q| &q.hits)
+            .filter(|h| h.is_dir)
+            .map(|h| h.path.as_slice())
+            .collect();
+        hits.into_iter()
+            .filter(|h| !all.contains(h.path.as_slice()) && !inside_any(&h.path, &dirs))
+            .collect()
+    };
+    let new_dirs: HashSet<&[u8]> = hits
+        .iter()
+        .filter(|h| h.is_dir)
+        .map(|h| h.path.as_slice())
+        .collect();
+    if !new_dirs.is_empty() {
+        for q in queue.iter_mut() {
+            let before = q.hits.len();
+            q.hits.retain(|h| !inside_any(&h.path, &new_dirs));
+            if q.hits.len() != before {
+                q.size = q.hits.iter().map(|h| h.size).sum();
+            }
+        }
+        queue.retain(|q| !q.hits.is_empty());
+    }
+    hits
 }
 
 /// The folders to rescan after running `dirs`: each once, minus those inside another.
@@ -1005,23 +1048,7 @@ impl App {
         let (recipe, hits) = self.current_step();
         let name = recipe.name.clone();
         let total = hits.len();
-        let hits: Vec<Hit> = hits
-            .into_iter()
-            .filter(|h| {
-                !self
-                    .queue
-                    .iter()
-                    .flat_map(|q| &q.hits)
-                    .any(|q| within(&h.path, &q.path) && (q.is_dir || q.path == h.path))
-            })
-            .collect();
-        for d in hits.iter().filter(|h| h.is_dir) {
-            for q in &mut self.queue {
-                q.hits.retain(|h| !within(&h.path, &d.path));
-                q.size = q.hits.iter().map(|h| h.size).sum();
-            }
-        }
-        self.queue.retain(|q| !q.hits.is_empty());
+        let hits = merge_new(&mut self.queue, hits);
         let added = hits.len();
         let size: u64 = hits.iter().map(|h| h.size).sum();
         if added > 0 {
@@ -1989,6 +2016,79 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn h(p: &str, is_dir: bool) -> Hit {
+        Hit {
+            path: p.as_bytes().to_vec(),
+            size: 10,
+            is_dir,
+            mtime: None,
+        }
+    }
+
+    fn step(hits: Vec<Hit>) -> Queued {
+        let r = Recipe {
+            name: "r".into(),
+            apply: Apply::Delete,
+            sql: String::new(),
+            file: PathBuf::new(),
+        };
+        Queued::new(r, PathBuf::from("/x"), hits)
+    }
+
+    fn paths(v: &[Hit]) -> Vec<&str> {
+        v.iter()
+            .map(|h| std::str::from_utf8(&h.path).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn merge_new_skips_queued_and_moves_paths_into_a_new_folder() {
+        let mut q = vec![step(vec![h("a/x", false), h("b", true), h("c/1", false)])];
+        let kept = merge_new(
+            &mut q,
+            vec![
+                h("a/x", false),      // queued
+                h("b/deep/f", false), // inside a queued folder
+                h("bb", false),       // a sibling with a common prefix: new
+                h("c", true),         // a folder holding a queued path: absorbs it
+                h("d", false),        // new
+            ],
+        );
+        assert_eq!(paths(&kept), ["bb", "c", "d"]);
+        assert_eq!(paths(&q[0].hits), ["a/x", "b"]);
+        assert_eq!(q[0].size, 20);
+        // A step whose paths all moved into a new folder disappears.
+        let mut q = vec![step(vec![h("c/1", false)]), step(vec![h("z", false)])];
+        merge_new(&mut q, vec![h("c", true)]);
+        assert_eq!(q.len(), 1);
+        assert_eq!(paths(&q[0].hits), ["z"]);
+    }
+
+    #[test]
+    fn merge_new_is_fast_with_huge_queues() {
+        // The old check compared every new path with every queued one: 10 billion pairs here.
+        let n = 100_000;
+        let mut q = vec![step(
+            (0..n)
+                .map(|i| h(&format!("p/d{}/f{i}", i % 1000), false))
+                .collect(),
+        )];
+        let new: Vec<Hit> = (0..n)
+            .map(|i| h(&format!("p/d{}/f{}", i % 1000, i + n / 2), false))
+            .chain((0..10).map(|i| h(&format!("p/d{i}"), true)))
+            .collect();
+        let t = std::time::Instant::now();
+        let kept = merge_new(&mut q, new);
+        assert!(t.elapsed().as_secs() < 10, "took {:?}", t.elapsed());
+        // The 10 new folders are kept, and absorb the queued files inside them (1 in 100).
+        let in_new_dirs = |p: &[u8]| (0..10).any(|i| p.starts_with(format!("p/d{i}/").as_bytes()));
+        assert_eq!(kept.iter().filter(|h| h.is_dir).count(), 10);
+        assert!(q[0].hits.iter().all(|h| !in_new_dirs(&h.path)));
+        assert_eq!(q[0].hits.len(), n - n / 100);
+        // Of the new files, the first half were queued already; the second half are new.
+        assert_eq!(kept.iter().filter(|h| !h.is_dir).count(), n / 2);
+    }
 
     #[test]
     fn fresh_covers_descendants_within_window() {
