@@ -13,6 +13,7 @@ struct Raw {
     stale_days: Option<u64>,
     rescan_skip_secs: Option<u64>,
     prune: Option<Vec<String>>,
+    large_file_mb: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -26,6 +27,8 @@ pub struct Config {
     pub rescan_skip_secs: u64,
     /// Directory name globs scanned for size only (`.git`, `processor[0-9]*`).
     pub prune: Vec<String>,
+    /// Files at least this big (MiB) are "large" for recipes: `large_file_bytes()`.
+    pub large_file_mb: u64,
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
@@ -37,6 +40,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if threads == 0 {
         return Err("threads must be at least 1".into());
     }
+    let large_file_mb = raw.large_file_mb.unwrap_or(1024);
+    if large_file_mb == 0 || large_file_mb > u64::MAX / (1 << 20) {
+        return Err("large_file_mb must be at least 1".into());
+    }
     let prune = raw.prune.unwrap_or_default();
     crate::scan::Prune::new(&prune).map_err(|e| format!("prune: {e}"))?;
     Ok(Config {
@@ -45,6 +52,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         stale_days: raw.stale_days.unwrap_or(7),
         rescan_skip_secs: raw.rescan_skip_secs.unwrap_or(300),
         prune,
+        large_file_mb,
     })
 }
 
@@ -119,6 +127,19 @@ mod tests {
         assert_eq!((c.root, c.threads, c.stale_days), ("/x".into(), 32, 7));
         let c = parse("root = \"/x\"\nthreads = 4\nstale_days = 1").unwrap();
         assert_eq!((c.threads, c.stale_days), (4, 1));
+    }
+
+    #[test]
+    fn large_file_mb_defaults_and_validates() {
+        assert_eq!(parse("root = \"/x\"").unwrap().large_file_mb, 1024);
+        assert_eq!(
+            parse("root = \"/x\"\nlarge_file_mb = 50")
+                .unwrap()
+                .large_file_mb,
+            50
+        );
+        assert!(parse("root = \"/x\"\nlarge_file_mb = 0").is_err());
+        assert!(parse("root = \"/x\"\nlarge_file_mb = -1").is_err());
     }
 
     #[test]

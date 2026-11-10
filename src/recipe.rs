@@ -21,7 +21,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +164,13 @@ pub struct Selection {
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ROWS: u64 = 5_000_000;
 const REGEX_CACHE: usize = 256;
+
+/// What `large_file_bytes()` returns in a recipe: set from `config.toml` at startup (1 GiB until then).
+static LARGE_FILE_BYTES: AtomicU64 = AtomicU64::new(1 << 30);
+
+pub fn set_large_file_bytes(n: u64) {
+    LARGE_FILE_BYTES.store(n, Ordering::Relaxed);
+}
 
 struct Limits {
     timeout: Duration,
@@ -318,6 +325,16 @@ fn sandbox(conn: &mut Connection, rel: &[u8], not_query: Arc<AtomicBool>) -> rus
             Ok(Some(c[pat].is_match(v)))
         },
     )?;
+    conn.create_scalar_function(
+        "large_file_bytes",
+        0,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |_| {
+            Ok(LARGE_FILE_BYTES
+                .load(Ordering::Relaxed)
+                .min(i64::MAX as u64) as i64)
+        },
+    )?;
     let range = if rel.is_empty() {
         "path > x''".to_string()
     } else {
@@ -444,6 +461,19 @@ mod tests {
         };
         let e = select_within(&db, &rec(FOREVER), &t.path().join("r"), lim).unwrap_err();
         assert_eq!(e, "recipe took too long (0 s)");
+    }
+
+    #[test]
+    fn large_file_bytes_comes_from_the_setting() {
+        let (t, db) = tiny_db();
+        // `f` holds one byte, so it is large only when the threshold is at most its size.
+        set_large_file_bytes(123_456_789);
+        let q = "SELECT path FROM entries WHERE large_file_bytes() = 123456789 AND dsize >= 0";
+        let s = select(&db, &rec(q), &t.path().join("r")).unwrap();
+        assert_eq!(s.count, 1);
+        let q = "SELECT path FROM entries WHERE large_file_bytes() = 1 AND dsize >= 0";
+        let s = select(&db, &rec(q), &t.path().join("r")).unwrap();
+        assert_eq!(s.count, 0);
     }
 
     #[test]

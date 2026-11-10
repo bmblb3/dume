@@ -107,6 +107,7 @@ STAR-CCM+ and ANSA examples are placeholders that fail until you fill in the `TO
 | `threads` | 32 | concurrent stats per scan; lower it if many people scan at once |
 | `stale_days` | 7 | warn when a scan is older |
 | `rescan_skip_secs` | 300 | `C` skips the rescan of a folder (re)scanned this recently in the session; 0 = always rescan |
+| `large_file_mb` | 1024 | what `large_file_bytes()` returns in a recipe, in MiB: for recipes that select big files |
 | `prune` | `[]` | directory-name globs (`*` `?` `[..]`, matched at any depth) that are walked for their size but not stored, e.g. `[".git", ".venv", "processor[0-9]*"]` |
 
 Unknown keys are errors.

@@ -41,6 +41,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<(), String> {
     let layout = layout::locate()?;
     let cfg = config::load(&layout)?;
+    recipe::set_large_file_bytes(cfg.large_file_mb.saturating_mul(1 << 20));
     let env = |k: &str| std::env::var_os(k);
     let db = match &cli.file {
         Some(f) => f.clone(),
