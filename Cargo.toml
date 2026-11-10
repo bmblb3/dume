@@ -1,6 +1,6 @@
 [package]
 name = "dume"
-version = "0.9.7"
+version = "0.9.8"
 description = "Scan one user's files into SQLite, browse them ncdu-style, and clean them with recipes"
 license = "MIT"
 edition = "2024"
