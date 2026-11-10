@@ -623,8 +623,12 @@ fn only_ticked_paths_are_removed_and_db_updated() {
         before - 5 * (64 << 10)
     );
 
+    // Any key: back to the menu at once, minus what was cleaned. No checks run again.
     key(&mut a, KeyCode::Char('x'));
-    assert_eq!(a.mode, Mode::List);
+    assert_eq!(a.mode, Mode::Menu);
+    assert!(!a.busy());
+    let s = screen(&mut a);
+    assert!(s.contains("Time steps") && s.contains("1 path"), "{s}");
     assert_eq!(a.root, e.root.join("proj"));
 }
 
@@ -786,7 +790,7 @@ fn footer_shows_keys_for_each_mode() {
     key(&mut a, KeyCode::Char('y'));
     assert!(screen(&mut a).contains("esc stop after the current path"));
     settle(&mut a);
-    assert!(screen(&mut a).contains("any key"));
+    assert!(screen(&mut a).contains("any key back to what to clean here"));
 }
 
 #[test]
@@ -1435,13 +1439,15 @@ fn a_queues_instead_of_cleaning_and_q_runs_the_queue() {
 }
 
 #[test]
-fn queueing_the_same_paths_twice_adds_nothing() {
+fn queued_paths_leave_the_menu() {
     let e = env();
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
     menu(&mut a);
     queue_first_recipe(&mut a);
-    let st = queue_first_recipe(&mut a);
-    assert!(st.contains("already queued"), "{st}");
+    let s = screen(&mut a);
+    assert!(s.contains("Time steps") && s.contains("none found"), "{s}");
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.mode, Mode::Menu, "nothing left to choose");
     key(&mut a, KeyCode::Esc);
     assert!(screen(&mut a).contains("Q queue (1)"));
 }
@@ -1557,4 +1563,111 @@ fn stopping_a_queue_run_puts_what_it_did_not_reach_back() {
     let s = screen(&mut a);
     // At most the path in progress ran; the other five (or six) are queued again.
     assert!(s.contains("5 paths") || s.contains("6 paths"), "{s}");
+}
+
+const STEPS: (&str, &str) = (
+    "steps.sql",
+    "-- dume-name: Step folders\nSELECT path FROM entries WHERE is_dir = 1 AND name REGEXP '^(100|200)$'",
+);
+
+#[test]
+fn c_again_shows_the_kept_results_at_once() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('c'));
+    assert_eq!(a.mode, Mode::Menu, "no wait: straight to the menu");
+    assert!(!a.busy());
+    let s = screen(&mut a);
+    assert!(
+        s.contains("earlier in this session") && s.contains("6 paths"),
+        "{s}"
+    );
+}
+
+#[test]
+fn fresh_checks_hide_what_is_queued() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    queue_first_recipe(&mut a);
+    key(&mut a, KeyCode::Esc);
+    menu(&mut a); // C: runs the checks again
+    let s = screen(&mut a);
+    assert!(s.contains("none found"), "{s}");
+}
+
+#[test]
+fn a_queued_folder_hides_the_files_inside_it_from_other_recipes() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG, STEPS]));
+    let s = menu(&mut a);
+    assert!(
+        s.contains("Step folders") && s.contains("Time steps"),
+        "{s}"
+    );
+    queue_first_recipe(&mut a); // Step folders comes first: all six step folders
+    let s = screen(&mut a);
+    // Time steps' files are all inside the queued folders.
+    assert_eq!(s.matches("none found").count(), 2, "{s}");
+}
+
+#[test]
+fn queueing_in_one_folder_updates_the_kept_results_of_another() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a); // proj: 6 paths, kept
+    key(&mut a, KeyCode::Esc);
+    highlight(&mut a, &e, "proj", "case_1");
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.root, e.root.join("proj/case_1"));
+    // c, not C: a rescan of case_1 would make proj's kept results out of date.
+    key(&mut a, KeyCode::Char('c'));
+    let s = settle(&mut a);
+    assert_eq!(a.mode, Mode::Menu, "{s}");
+    assert!(s.contains("2 paths"), "{s}");
+    queue_first_recipe(&mut a);
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Backspace);
+    assert_eq!(a.root, e.root.join("proj"));
+    key(&mut a, KeyCode::Char('c'));
+    assert_eq!(a.mode, Mode::Menu);
+    let s = screen(&mut a);
+    assert!(s.contains("4 paths"), "case_1's two are queued: {s}");
+}
+
+#[test]
+fn dropping_a_queued_step_runs_the_checks_again_next_time() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    queue_first_recipe(&mut a);
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('Q'));
+    key(&mut a, KeyCode::Char('d'));
+    assert_eq!(a.mode, Mode::List);
+    key(&mut a, KeyCode::Char('c'));
+    assert_eq!(
+        a.mode,
+        Mode::Refreshing,
+        "kept results were dropped with the step"
+    );
+    let s = settle(&mut a);
+    assert!(s.contains("6 paths"), "{s}");
+}
+
+#[test]
+fn capital_c_drops_the_kept_results_of_folders_above() {
+    let e = env();
+    let mut a = app_with(&e, "proj", recipes(&e, &[BIG]));
+    menu(&mut a);
+    key(&mut a, KeyCode::Esc);
+    highlight(&mut a, &e, "proj", "case_1");
+    key(&mut a, KeyCode::Enter);
+    menu(&mut a); // C in case_1
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Backspace);
+    key(&mut a, KeyCode::Char('c'));
+    assert_eq!(a.mode, Mode::Refreshing, "proj is checked again");
 }

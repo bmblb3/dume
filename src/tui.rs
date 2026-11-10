@@ -13,7 +13,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph, Row as TRow, Table, TableState, Wrap};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -48,6 +48,9 @@ pub enum Mode {
     QuitAsk,
 }
 
+/// Recipe results for one folder, in arrival order: (recipe index, result).
+type Picks = Vec<(usize, Result<Selection, String>)>;
+
 /// One queued step: a recipe's ticked hits, in the folder they were picked in. Running it
 /// goes through `apply::run` like any other run, so every path is checked again then.
 #[derive(Clone)]
@@ -79,30 +82,107 @@ fn inside_any(p: &[u8], dirs: &HashSet<&[u8]>) -> bool {
             .any(|(i, &b)| b == b'/' && dirs.contains(&p[..i]))
 }
 
-/// Keep the `hits` not queued yet: not a queued path, not inside a queued folder. Queued
-/// paths inside a newly kept folder move into it (they are dropped from their step). Cost:
-/// one pass over the queue plus a few set lookups per path, so `a` stays instant with
-/// millions of queued paths.
-fn merge_new(queue: &mut Vec<Queued>, hits: Vec<Hit>) -> Vec<Hit> {
+/// Paths being queued or cleaned, indexed for quick "is this one of them, or inside one".
+struct Marked<'a> {
+    all: HashSet<&'a [u8]>,
+    dirs: HashSet<&'a [u8]>,
+    hits: &'a [Hit],
+}
+
+impl<'a> Marked<'a> {
+    fn new(hits: &'a [Hit]) -> Marked<'a> {
+        Marked {
+            all: hits.iter().map(|h| h.path.as_slice()).collect(),
+            dirs: hits
+                .iter()
+                .filter(|h| h.is_dir)
+                .map(|h| h.path.as_slice())
+                .collect(),
+            hits,
+        }
+    }
+}
+
+/// Take `m` out of a recipe's results: hits that are, or lie inside, a marked path go.
+/// `shrink` (deletes): a folder hit holding marked paths loses their size. Set lookups
+/// only, so this is instant for millions of paths.
+fn take_out(sel: &mut Selection, m: &Marked, shrink: bool) {
+    if m.hits.is_empty() {
+        return;
+    }
+    let before = sel.hits.len();
+    sel.hits
+        .retain(|h| !m.all.contains(h.path.as_slice()) && !inside_any(&h.path, &m.dirs));
+    let mut changed = sel.hits.len() != before;
+    if shrink {
+        // Hits never nest (see recipe::select), so a marked path lies in at most one.
+        let cut: Vec<(usize, u64)> = {
+            let at: HashMap<&[u8], usize> = sel
+                .hits
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.is_dir)
+                .map(|(i, h)| (h.path.as_slice(), i))
+                .collect();
+            m.hits
+                .iter()
+                .filter_map(|h| {
+                    h.path
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &b)| b == b'/')
+                        .find_map(|(j, _)| at.get(&h.path[..j]).map(|&k| (k, h.size)))
+                })
+                .collect()
+        };
+        for (k, size) in cut {
+            sel.hits[k].size = sel.hits[k].size.saturating_sub(size);
+            changed = true;
+        }
+    }
+    if changed {
+        sel.count = sel.hits.len() as u64;
+        sel.size = sel.hits.iter().map(|h| h.size).sum();
+    }
+}
+
+/// Keep the `hits` of `recipe` not queued yet. A queued delete covers a path and all inside
+/// it; a queued script covers only its own repeats (its files stay). A new delete absorbs
+/// queued paths inside the folders it removes. Cost: one pass over the queue plus a few
+/// set lookups per path, so `a` stays instant with millions of queued paths.
+fn merge_new(queue: &mut Vec<Queued>, hits: Vec<Hit>, recipe: &Recipe) -> Vec<Hit> {
+    let deleting = |q: &Queued| matches!(q.recipe.apply, Apply::Delete);
+    let script = matches!(recipe.apply, Apply::Script(_));
     let hits: Vec<Hit> = {
-        let all: HashSet<&[u8]> = queue
+        let gone: HashSet<&[u8]> = queue
             .iter()
+            .filter(|q| deleting(q))
             .flat_map(|q| &q.hits)
             .map(|h| h.path.as_slice())
             .collect();
-        let dirs: HashSet<&[u8]> = queue
+        let gone_dirs: HashSet<&[u8]> = queue
             .iter()
+            .filter(|q| deleting(q))
             .flat_map(|q| &q.hits)
             .filter(|h| h.is_dir)
             .map(|h| h.path.as_slice())
             .collect();
+        let same: HashSet<&[u8]> = queue
+            .iter()
+            .filter(|q| script && q.recipe.file == recipe.file)
+            .flat_map(|q| &q.hits)
+            .map(|h| h.path.as_slice())
+            .collect();
         hits.into_iter()
-            .filter(|h| !all.contains(h.path.as_slice()) && !inside_any(&h.path, &dirs))
+            .filter(|h| {
+                let p = h.path.as_slice();
+                !gone.contains(p) && !inside_any(p, &gone_dirs) && !same.contains(p)
+            })
             .collect()
     };
     let new_dirs: HashSet<&[u8]> = hits
         .iter()
-        .filter(|h| h.is_dir)
+        .filter(|h| h.is_dir && !script)
         .map(|h| h.path.as_slice())
         .collect();
     if !new_dirs.is_empty() {
@@ -388,7 +468,7 @@ pub struct App {
     stack: Vec<(PathBuf, usize)>,
     rx: Option<Receiver<Msg>>,
     /// Clean flow: recipe results in recipe order, from the database refreshed for `root`.
-    picks: Vec<(usize, Result<Selection, String>)>,
+    picks: Picks,
     /// Menu cursor, an index into [`App::shown`].
     msel: usize,
     /// The chosen entry of `picks`, and which of its hits are ticked.
@@ -405,6 +485,12 @@ pub struct App {
     del: Option<Del>,
     /// Steps queued with `a`, in order; run with `Q`, then `r`.
     queue: Vec<Queued>,
+    /// The folder `picks` belong to. Finished results of folders checked earlier this
+    /// session wait in `cache`, kept up to date as paths are queued or cleaned.
+    picks_dir: Option<PathBuf>,
+    cache: HashMap<PathBuf, Picks>,
+    /// A direct run's recipe and paths: those cleaned come out of the results when it ends.
+    ran: Option<(Recipe, Vec<Hit>)>,
     /// Queue view cursor.
     qsel: usize,
     /// The running (or last) run is the queue; `queue_before` is the scan's size before it.
@@ -462,6 +548,9 @@ impl App {
             outcome: None,
             del: None,
             queue: Vec::new(),
+            picks_dir: None,
+            cache: HashMap::new(),
+            ran: None,
             qsel: 0,
             queue_run: false,
             queue_before: 0,
@@ -703,7 +792,67 @@ impl App {
     /// `c`: rescan `root`, then run every recipe on the refreshed database, in one worker,
     /// so the hits can only come from a database refreshed for this directory just now.
     /// `C` (`rescan`) does that; `c` runs the recipes on the database as it is, without a rescan.
+    /// Keep the finished results of the folder last checked, for `c` there again.
+    fn park(&mut self) {
+        if let Some(d) = self.picks_dir.take() {
+            let p = std::mem::take(&mut self.picks);
+            if p.len() == self.recipes.len() {
+                self.cache.insert(d, p);
+            }
+        }
+    }
+
+    /// Kept results of `dir`, and of folders above or below it, no longer match the scan.
+    fn invalidate(&mut self, dir: &Path) {
+        self.cache
+            .retain(|k, _| !(k.starts_with(dir) || dir.starts_with(k)));
+    }
+
+    /// Drop every kept result: they may hide paths that are still there.
+    fn forget_all(&mut self) {
+        self.cache.clear();
+        self.picks.clear();
+        self.picks_dir = None;
+    }
+
+    /// `hits`, now queued or cleaned by `recipe`, come out of every result this session:
+    /// all recipes' for a delete, only `recipe`'s own for a script (the files stay).
+    fn forget(&mut self, recipe: &Recipe, hits: &[Hit]) {
+        let m = Marked::new(hits);
+        let script = matches!(recipe.apply, Apply::Script(_));
+        let recipes = &self.recipes;
+        for list in std::iter::once(&mut self.picks).chain(self.cache.values_mut()) {
+            for (i, res) in list.iter_mut() {
+                if let Ok(sel) = res {
+                    if !script {
+                        take_out(sel, &m, true);
+                    } else if recipes[*i].file == recipe.file {
+                        take_out(sel, &m, false);
+                    }
+                }
+            }
+        }
+    }
+
     fn start_clean(&mut self, rescan: bool) {
+        let here = self.root.clone();
+        self.park();
+        if rescan {
+            self.invalidate(&here);
+        } else if let Some(p) = self.cache.remove(&here) {
+            // Checked earlier this session: show those results, kept up to date, at once.
+            self.del = None;
+            self.picks = p;
+            self.picks_dir = Some(here);
+            self.msel = 0;
+            self.saved_note = Some(
+                "Results from earlier in this session, minus what you marked since. C runs the checks again."
+                    .into(),
+            );
+            self.mode = Mode::Menu;
+            return;
+        }
+        self.picks_dir = Some(here);
         self.del = None;
         self.progress = Arc::default();
         self.scan_started = Instant::now();
@@ -1035,6 +1184,7 @@ impl App {
 
     fn start_run(&mut self) {
         let (recipe, hits) = self.current_step();
+        self.ran = Some((recipe.clone(), hits.clone()));
         let here = self.root.clone();
         let del = self.del.as_ref().map(|d| d.target.clone());
         let job = Queued::new(recipe, here.clone(), hits);
@@ -1048,7 +1198,8 @@ impl App {
         let (recipe, hits) = self.current_step();
         let name = recipe.name.clone();
         let total = hits.len();
-        let hits = merge_new(&mut self.queue, hits);
+        let hits = merge_new(&mut self.queue, hits, &recipe);
+        self.forget(&recipe, &hits);
         let added = hits.len();
         let size: u64 = hits.iter().map(|h| h.size).sum();
         if added > 0 {
@@ -1082,6 +1233,16 @@ impl App {
             .unwrap_or(0);
         self.del = None;
         self.run_jobs(jobs, dirs, None, true);
+    }
+
+    /// After a run: a recipe run started from the menu goes back to it (with what it cleaned
+    /// taken out); `x` and queue runs go back to the folder.
+    fn done_to_menu(&self) -> bool {
+        self.del.is_none()
+            && !self.queue_run
+            && self.picks_dir.as_deref() == Some(self.root.as_path())
+            && self.picks.len() == self.recipes.len()
+            && is_dir(&self.root)
     }
 
     /// `q` or ctrl-c: with steps still queued, ask first.
@@ -1249,8 +1410,9 @@ impl App {
             }
             Mode::Done => {
                 self.status.clear();
+                let menu = self.done_to_menu();
                 self.del = None;
-                self.mode = Mode::List;
+                self.mode = if menu { Mode::Menu } else { Mode::List };
             }
             Mode::Queue => {
                 self.status.clear();
@@ -1262,6 +1424,7 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
                         if self.qsel < self.queue.len() {
                             let q = self.queue.remove(self.qsel);
+                            self.forget_all();
                             self.status = format!("Dropped {} from the queue.", q.recipe.name);
                             self.qsel = self.qsel.min(self.queue.len().saturating_sub(1));
                         }
@@ -1299,6 +1462,7 @@ impl App {
                     self.rx = None;
                     match res {
                         Ok(files) => {
+                            self.forget_all();
                             self.fresh.clear();
                             self.fresh.push((self.scan_root.clone(), Instant::now()));
                             self.browse();
@@ -1314,13 +1478,39 @@ impl App {
                     }
                 }
                 Msg::Refreshed(res) => self.on_refreshed(res),
-                Msg::Picked(i, res) => self.picks.push((i, res)),
+                Msg::Picked(i, mut res) => {
+                    // Already queued: not shown again (scripts: only in their own recipe).
+                    if let Ok(sel) = &mut res {
+                        for q in &self.queue {
+                            let script = matches!(q.recipe.apply, Apply::Script(_));
+                            if !script || self.recipes[i].file == q.recipe.file {
+                                take_out(sel, &Marked::new(&q.hits), !script);
+                            }
+                        }
+                    }
+                    self.picks.push((i, res));
+                }
                 Msg::Step(done, total, path) => self.step = (done, total, path),
                 Msg::Requeue(back) => {
                     self.queue.splice(0..0, back);
                 }
                 Msg::Applied(done, problems, res, left) => {
                     self.rx = None;
+                    if let Some((r, hits)) = self.ran.take() {
+                        let bad: HashSet<&[u8]> =
+                            problems.iter().map(|(p, _)| p.as_slice()).collect();
+                        let gone: Vec<Hit> = hits
+                            .into_iter()
+                            .filter(|h| !bad.contains(h.path.as_slice()))
+                            .collect();
+                        self.forget(&r, &gone);
+                    } else if problems
+                        .iter()
+                        .any(|(_, v)| !matches!(v, Verdict::Skipped(w) if w == "cancelled"))
+                    {
+                        // Queued paths were taken out when queued; some are still there.
+                        self.forget_all();
+                    }
                     let before = if self.queue_run {
                         self.queue_before
                     } else {
@@ -1388,6 +1578,7 @@ impl App {
             }
             Mode::Confirm => "y yes, clean · a queue instead · n/esc back".into(),
             Mode::Running => "esc stop after the current path".into(),
+            Mode::Done if self.done_to_menu() => "any key back to what to clean here".into(),
             Mode::Done => "any key back to the folder".into(),
             Mode::Queue => "↑↓ move · d drop step · r run all · esc back".into(),
             Mode::QueueConfirm => "y yes, run them all · n/esc back".into(),
@@ -2026,14 +2217,26 @@ mod tests {
         }
     }
 
-    fn step(hits: Vec<Hit>) -> Queued {
-        let r = Recipe {
+    fn del() -> Recipe {
+        Recipe {
             name: "r".into(),
             apply: Apply::Delete,
             sql: String::new(),
-            file: PathBuf::new(),
-        };
-        Queued::new(r, PathBuf::from("/x"), hits)
+            file: PathBuf::from("del.sql"),
+        }
+    }
+
+    fn ansa() -> Recipe {
+        Recipe {
+            name: "s".into(),
+            apply: Apply::Script(PathBuf::from("ansa.sh")),
+            sql: String::new(),
+            file: PathBuf::from("ansa.sql"),
+        }
+    }
+
+    fn step(hits: Vec<Hit>) -> Queued {
+        Queued::new(del(), PathBuf::from("/x"), hits)
     }
 
     fn paths(v: &[Hit]) -> Vec<&str> {
@@ -2054,15 +2257,60 @@ mod tests {
                 h("c", true),         // a folder holding a queued path: absorbs it
                 h("d", false),        // new
             ],
+            &del(),
         );
         assert_eq!(paths(&kept), ["bb", "c", "d"]);
         assert_eq!(paths(&q[0].hits), ["a/x", "b"]);
         assert_eq!(q[0].size, 20);
         // A step whose paths all moved into a new folder disappears.
         let mut q = vec![step(vec![h("c/1", false)]), step(vec![h("z", false)])];
-        merge_new(&mut q, vec![h("c", true)]);
+        merge_new(&mut q, vec![h("c", true)], &del());
         assert_eq!(q.len(), 1);
         assert_eq!(paths(&q[0].hits), ["z"]);
+    }
+
+    #[test]
+    fn merge_new_treats_scripts_as_keeping_their_files() {
+        let s = |hits| Queued::new(ansa(), PathBuf::from("/x"), hits);
+        // Queued for the script: the same script again is a repeat, a delete is not.
+        let mut q = vec![s(vec![h("m.ansa", false)])];
+        assert!(merge_new(&mut q, vec![h("m.ansa", false)], &ansa()).is_empty());
+        assert_eq!(
+            paths(&merge_new(&mut q, vec![h("m.ansa", false)], &del())),
+            ["m.ansa"]
+        );
+        // Queued for deletion: nothing more to do to it, script or not.
+        let mut q = vec![step(vec![h("d", true)])];
+        assert!(merge_new(&mut q, vec![h("d/m.ansa", false)], &ansa()).is_empty());
+        // A script on a folder does not absorb queued paths inside it.
+        let mut q = vec![step(vec![h("e/1", false)])];
+        merge_new(&mut q, vec![h("e", true)], &ansa());
+        assert_eq!(paths(&q[0].hits), ["e/1"]);
+    }
+
+    #[test]
+    fn take_out_removes_marked_and_shrinks_folders_holding_them() {
+        let sel = |hits: Vec<Hit>| Selection {
+            count: hits.len() as u64,
+            size: hits.iter().map(|h| h.size).sum(),
+            hits,
+        };
+        let mut a = sel(vec![
+            h("t/100", true),
+            h("t/200", true),
+            h("u/x.vtk", false),
+        ]);
+        a.hits[0].size = 100;
+        let marked = vec![h("t/100/x.vtk", false), h("u", true)];
+        let m = Marked::new(&marked);
+        let mut b = a.clone();
+        take_out(&mut a, &m, true);
+        // u/x.vtk is inside the marked folder u; t/100 holds a marked 10-byte file.
+        assert_eq!(paths(&a.hits), ["t/100", "t/200"]);
+        assert_eq!((a.hits[0].size, a.count, a.size), (90, 2, 100));
+        // Scripts keep their files: no shrinking.
+        take_out(&mut b, &m, false);
+        assert_eq!((b.hits[0].size, b.count, b.size), (100, 2, 110));
     }
 
     #[test]
@@ -2079,7 +2327,7 @@ mod tests {
             .chain((0..10).map(|i| h(&format!("p/d{i}"), true)))
             .collect();
         let t = std::time::Instant::now();
-        let kept = merge_new(&mut q, new);
+        let kept = merge_new(&mut q, new, &del());
         assert!(t.elapsed().as_secs() < 10, "took {:?}", t.elapsed());
         // The 10 new folders are kept, and absorb the queued files inside them (1 in 100).
         let in_new_dirs = |p: &[u8]| (0..10).any(|i| p.starts_with(format!("p/d{i}/").as_bytes()));

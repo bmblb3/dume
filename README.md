@@ -37,6 +37,12 @@ step instead of running it, then carry on picking in other folders. `Q` shows th
 queued twice. If you stop a queue run with `esc`, what it did not reach goes back in the queue. The queue
 lives only while dume runs: quitting with steps queued asks first.
 
+**Results are kept for the session.** `c` in a folder you already checked shows its results at once.
+Paths you queue or clean are taken out of every kept result (a folder hit shrinks by what was taken from
+inside it; a script's files stay visible to other recipes), and after a run any key goes back to the
+list. `C` checks again from scratch. A recipe that depends on other files (time folders next to a
+`constant` folder) can be out of date until `C`; every path is still checked before it is touched.
+
 **Everything is permanent**: there is no undo. Read the path list before confirming.
 
 `N` opens everything in ncdu (an admin tool, optional).
