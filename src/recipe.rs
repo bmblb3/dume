@@ -3,6 +3,7 @@
 //! ```sql
 //! -- dume-name: Clean OpenFOAM case
 //! -- dume-apply: delete | clean.sh
+//! -- dume-priority: 10          (optional; higher is listed first, default 0)
 //! SELECT path FROM entries WHERE ...
 //! ```
 
@@ -37,7 +38,7 @@ pub struct Recipe {
     pub file: PathBuf,
 }
 
-/// Recipes in `dir` sorted by name, plus a message for each `.sql` file skipped. A missing
+/// Recipes in `dir`, highest `dume-priority` first and then by name, plus a message for each `.sql` file skipped. A missing
 /// directory means no recipes; one that others can write to is refused, and so are files
 /// (and scripts) they can write to.
 pub fn load(dir: &Path) -> io::Result<(Vec<Recipe>, Vec<String>)> {
@@ -55,19 +56,20 @@ pub fn load(dir: &Path) -> io::Result<(Vec<Recipe>, Vec<String>)> {
             continue;
         }
         match parse(dir, &path) {
-            Ok(r) => out.push(r),
+            Ok(rp) => out.push(rp),
             Err(e) => skipped.push(format!("{fname}: {e}")),
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((out, skipped))
+    out.sort_by(|(a, pa), (b, pb)| pb.cmp(pa).then_with(|| a.name.cmp(&b.name)));
+    Ok((out.into_iter().map(|(r, _)| r).collect(), skipped))
 }
 
-fn parse(dir: &Path, path: &Path) -> Result<Recipe, String> {
+/// The recipe and its `dume-priority` (0 when absent).
+fn parse(dir: &Path, path: &Path) -> Result<(Recipe, i64), String> {
     regular(path)?;
     check_private(path)?;
     let sql = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
-    let (mut name, mut apply) = (None, Apply::Delete);
+    let (mut name, mut apply, mut priority) = (None, Apply::Delete, 0);
     let mut in_header = true;
     for line in sql.lines() {
         let t = line.trim();
@@ -77,7 +79,10 @@ fn parse(dir: &Path, path: &Path) -> Result<Recipe, String> {
         }
         let Some(c) = c else { continue };
         if !in_header {
-            if c.starts_with("dume-name:") || c.starts_with("dume-apply:") {
+            if ["dume-name:", "dume-apply:", "dume-priority:"]
+                .iter()
+                .any(|h| c.starts_with(h))
+            {
                 return Err("dume header after the query starts; headers must come first".into());
             }
             continue;
@@ -89,15 +94,23 @@ fn parse(dir: &Path, path: &Path) -> Result<Recipe, String> {
                 "delete" => Apply::Delete,
                 s => Apply::Script(script(dir, s)?),
             };
+        } else if let Some(v) = c.strip_prefix("dume-priority:") {
+            priority = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("dume-priority `{}`: not a whole number", v.trim()))?;
         }
     }
     let name = name.ok_or("missing `-- dume-name:` header (headers must come before the query)")?;
-    Ok(Recipe {
-        name,
-        apply,
-        sql,
-        file: path.to_path_buf(),
-    })
+    Ok((
+        Recipe {
+            name,
+            apply,
+            sql,
+            file: path.to_path_buf(),
+        },
+        priority,
+    ))
 }
 
 /// A regular file, not a symlink (a link could point at a file outside this directory).
@@ -465,6 +478,81 @@ mod tests {
         assert_eq!(r[1].name, "Bee");
         assert_eq!(r[1].apply, Apply::Delete);
         assert_eq!(r[1].file, t.path().join("b.sql"));
+    }
+
+    #[test]
+    fn priority_orders_recipes_highest_first_then_by_name() {
+        let t = dir();
+        put(t.path(), "a.sql", "-- dume-name: Ay\nSELECT 1;", 0o644);
+        put(
+            t.path(),
+            "z.sql",
+            "-- dume-name: Zed\n-- dume-priority: 10\nSELECT 1;",
+            0o644,
+        );
+        put(
+            t.path(),
+            "m.sql",
+            "-- dume-name: Em\n-- dume-priority: 10\nSELECT 1;",
+            0o644,
+        );
+        put(
+            t.path(),
+            "n.sql",
+            "-- dume-name: En\n-- dume-priority: -5\nSELECT 1;",
+            0o644,
+        );
+        put(
+            t.path(),
+            "b.sql",
+            "-- dume-name: Bee\n-- dume-priority:  +3 \nSELECT 1;",
+            0o644,
+        );
+        let (r, skipped) = load(t.path()).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let names: Vec<_> = r.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Em", "Zed", "Bee", "Ay", "En"]);
+    }
+
+    #[test]
+    fn bad_or_late_priority_is_skipped() {
+        let t = dir();
+        put(
+            t.path(),
+            "f.sql",
+            "-- dume-name: F\n-- dume-priority: high\nSELECT 1;",
+            0o644,
+        );
+        put(
+            t.path(),
+            "e.sql",
+            "-- dume-name: E\n-- dume-priority:\nSELECT 1;",
+            0o644,
+        );
+        put(
+            t.path(),
+            "l.sql",
+            "-- dume-name: L\nSELECT 1;\n-- dume-priority: 5\n",
+            0o644,
+        );
+        let (r, skipped) = load(t.path()).unwrap();
+        assert!(r.is_empty(), "{r:?}");
+        assert_eq!(skipped.len(), 3, "{skipped:?}");
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("f.sql") && s.contains("not a whole number"))
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("e.sql") && s.contains("not a whole number"))
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("l.sql") && s.contains("after the query starts"))
+        );
     }
 
     #[test]

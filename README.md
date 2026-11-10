@@ -79,7 +79,9 @@ WHERE name REGEXP '^([1-9][0-9]*|[0-9]*\.[0-9]+([eE]-?[0-9]+)?|[0-9]+[eE]-?[0-9]
    OR name REGEXP '^(polyMesh|dynamicCode)$|^processor[0-9]*$|^core(\.[0-9]+)?$'
 ```
 
-`dume-name` is required. `dume-apply` is `delete` (the default) or a script in the same directory. This
+`dume-name` is required. `dume-apply` is `delete` (the default) or a script in the same directory.
+`-- dume-priority: N` (optional, a whole number, default 0) orders the menu: higher is listed (and checked)
+first, so put the most effective and safest recipes on top; equal priorities are sorted by name. This
 example selects OpenFOAM time folders (`100`, `0.5`, `1e-05`, but never `0`, which holds the case inputs),
 `polyMesh`, `dynamicCode`, `processor*` and core files.
 
