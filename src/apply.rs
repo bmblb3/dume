@@ -296,14 +296,28 @@ fn script(s: &Path, here: &Path, target: &Path, bin: Option<&Path>) -> Verdict {
     let Ok(path) = std::env::join_paths(paths) else {
         return Verdict::Failed("cannot build PATH".into());
     };
-    let out = Command::new(s)
-        .arg(target)
-        .current_dir(here)
-        .env("PATH", path)
-        .env("DUME_HERE", here)
-        .env("DUME_PATH", target)
-        .stdin(Stdio::null())
-        .output();
+    let run = || {
+        Command::new(s)
+            .arg(target)
+            .current_dir(here)
+            .env("PATH", &path)
+            .env("DUME_HERE", here)
+            .env("DUME_PATH", target)
+            .stdin(Stdio::null())
+            .output()
+    };
+    // ETXTBSY: the script is briefly open for writing somewhere (being saved, or a write
+    // handle inherited by a child another thread forked). Retry a few times, as cargo does.
+    let mut out = run();
+    for wait in [10, 50, 200] {
+        match &out {
+            Err(e) if e.raw_os_error() == Some(Errno::TXTBSY.raw_os_error()) => {
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+                out = run();
+            }
+            _ => break,
+        }
+    }
     match out {
         Ok(o) if o.status.success() => Verdict::Done,
         Ok(o) => {
