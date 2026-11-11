@@ -13,6 +13,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph, Row as TRow, Table, TableState, Wrap};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
@@ -23,6 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime};
+
+/// Recipe queries run at once for `c`. Each is a read-only SQLite connection.
+const RECIPE_THREADS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -479,6 +483,8 @@ pub struct App {
     psel: usize,
     poff: usize,
     cancel: Arc<AtomicBool>,
+    /// Set to stop the recipe checks of the last `c` from starting new recipes.
+    stop_checks: Arc<AtomicBool>,
     /// Running: (done, total, last path).
     step: (usize, usize, String),
     outcome: Option<Outcome>,
@@ -544,6 +550,7 @@ impl App {
             psel: 0,
             poff: 0,
             cancel: Arc::default(),
+            stop_checks: Arc::default(),
             step: (0, 0, String::new()),
             outcome: None,
             del: None,
@@ -834,8 +841,15 @@ impl App {
         }
     }
 
+    /// Recipe checks still running for the last `c` stop starting new recipes.
+    fn stop_checks(&mut self) {
+        self.stop_checks.store(true, Ordering::Relaxed);
+        self.stop_checks = Arc::default();
+    }
+
     fn start_clean(&mut self, rescan: bool) {
         let here = self.root.clone();
+        self.stop_checks();
         self.park();
         if rescan {
             self.invalidate(&here);
@@ -894,6 +908,7 @@ impl App {
         self.refreshing = rescan.then(|| here.clone());
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
+        let stop = self.stop_checks.clone();
         std::thread::spawn(move || {
             // Safe: file hits are re-checked by mtime at delete time (apply.rs check_as) and
             // folder removal deletes what is on disk, so a stale list only affects what is shown.
@@ -909,24 +924,31 @@ impl App {
             if tx.send(Msg::Refreshed(res)).is_err() || !ok {
                 return;
             }
-            let d = match Db::open_ro(&db) {
-                Ok(d) => d,
-                Err(e) => {
-                    for i in 0..recipes.len() {
-                        let _ = tx.send(Msg::Picked(i, Err(e.to_string())));
-                    }
-                    return;
+            // Recipes run side by side, each on its own read-only connection. Each result is
+            // sent as it finishes, with its recipe index, so the menu can show it at once.
+            let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                .num_threads(RECIPE_THREADS)
+                .build()
+            else {
+                for i in 0..recipes.len() {
+                    let _ = tx.send(Msg::Picked(i, Err("no threads for the checks".into())));
                 }
+                return;
             };
-            for (i, r) in recipes.iter().enumerate() {
-                // Stop once nobody listens (esc, or a run started).
-                if tx
-                    .send(Msg::Picked(i, recipe::select(&d, r, &here)))
-                    .is_err()
-                {
-                    return;
-                }
-            }
+            pool.install(|| {
+                recipes.par_iter().enumerate().for_each(|(i, r)| {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let res = Db::open_ro(&db)
+                        .map_err(|e| e.to_string())
+                        .and_then(|d| recipe::select(&d, r, &here));
+                    // Stop starting recipes once nobody listens (esc, or a run started).
+                    if stop.load(Ordering::Relaxed) || tx.send(Msg::Picked(i, res)).is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                });
+            });
         });
     }
 
@@ -1067,9 +1089,17 @@ impl App {
 
     /// Indexes into `picks` of the recipes that can be chosen: those that found something.
     fn shown(&self) -> Vec<usize> {
-        (0..self.picks.len())
+        let mut v: Vec<usize> = (0..self.picks.len())
             .filter(|&i| self.picks[i].1.as_ref().is_ok_and(|s| !s.hits.is_empty()))
-            .collect()
+            .collect();
+        // Picks arrive as each recipe finishes; the cursor follows the menu's recipe order.
+        v.sort_by_key(|&i| self.picks[i].0);
+        v
+    }
+
+    /// The finished result of recipe `k`, if it has finished.
+    fn pick_of(&self, k: usize) -> Option<&(usize, Result<Selection, String>)> {
+        self.picks.iter().find(|(i, _)| *i == k)
     }
 
     /// The chosen recipe and its selection (Paths, Confirm).
@@ -1100,13 +1130,11 @@ impl App {
         }
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
+                self.stop_checks();
                 self.rx = None;
                 self.mode = Mode::List;
             }
-            // A run's rescan must not wait on a recipe query still reading the database.
-            KeyCode::Enter if self.computing() => {
-                self.status = "Still checking recipes — one moment…".into();
-            }
+            // Finished recipes can be opened while others still run; a run waits (start_run).
             KeyCode::Enter => {
                 let Some(&i) = shown.get(self.msel) else {
                     return;
@@ -1183,6 +1211,11 @@ impl App {
     }
 
     fn start_run(&mut self) {
+        // A run's rescan must not wait on recipe queries still reading the database.
+        if self.computing() {
+            self.status = "Still checking recipes — one moment…".into();
+            return;
+        }
         let (recipe, hits) = self.current_step();
         self.ran = Some((recipe.clone(), hits.clone()));
         let here = self.root.clone();
@@ -1224,6 +1257,10 @@ impl App {
 
     /// `r`, `y` in the queue: run every queued step in order, then rescan each folder once.
     fn start_queue(&mut self) {
+        if self.computing() {
+            self.status = "Still checking recipes — one moment…".into();
+            return;
+        }
         let jobs = std::mem::take(&mut self.queue);
         let dirs = tops(jobs.iter().map(|q| q.here.clone()).collect());
         self.queue_before = self
@@ -1382,6 +1419,7 @@ impl App {
             Mode::Refreshing => {
                 if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                     // The scan can't be interrupted; its result is applied when it ends.
+                    self.stop_checks();
                     self.del = None;
                     self.mode = Mode::List;
                 }
@@ -1771,7 +1809,7 @@ impl App {
             .recipes
             .iter()
             .enumerate()
-            .map(|(k, r)| match self.picks.get(k) {
+            .map(|(k, r)| match self.pick_of(k) {
                 Some((_, Ok(s))) if !s.hits.is_empty() => TRow::new([
                     r.name.clone(),
                     n_paths(s.hits.len()),
@@ -1783,11 +1821,8 @@ impl App {
                 Some((_, Err(_))) => {
                     TRow::new([r.name.clone(), "failed".into(), String::new()]).yellow()
                 }
-                None if busy && k == self.picks.len() => {
-                    TRow::new([r.name.clone(), format!("{spin} looking…"), String::new()])
-                }
                 None if busy => {
-                    TRow::new([r.name.clone(), "waiting".into(), String::new()]).style(dim)
+                    TRow::new([r.name.clone(), format!("{spin} looking…"), String::new()])
                 }
                 None => TRow::new([r.name.clone(), "not checked".into(), String::new()]).style(dim),
             })
@@ -1803,9 +1838,10 @@ impl App {
                 "Go back (esc) and try another folder, or a folder above.",
             ));
         }
-        notes.extend(self.picks.iter().filter_map(|(i, res)| {
+        notes.extend((0..self.recipes.len()).filter_map(|k| {
+            let (_, res) = self.pick_of(k)?;
             let e = res.as_ref().err()?;
-            Some(Line::from(format!("recipe {} failed: {e}", self.recipes[*i].name)).yellow())
+            Some(Line::from(format!("recipe {} failed: {e}", self.recipes[k].name)).yellow())
         }));
         let [list, errs] = Layout::vertical([
             Constraint::Length(rows.len().max(1) as u16),
@@ -1814,7 +1850,7 @@ impl App {
         .areas(list);
         f.render_widget(Paragraph::new(notes).wrap(Wrap { trim: false }), errs);
         self.msel = self.msel.min(shown.len().saturating_sub(1));
-        // The cursor row is the recipe's own row: picks arrive in recipe order.
+        // The cursor row is the recipe's own row.
         let cursor = shown.get(self.msel).map(|&i| self.picks[i].0);
         // shortcut: the menu is not windowed; there are only as many lines as recipes.
         let widths = [

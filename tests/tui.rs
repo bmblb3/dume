@@ -836,29 +836,67 @@ fn slow(n: u64) -> String {
 }
 
 #[test]
-fn cannot_start_a_clean_while_recipes_are_still_being_checked() {
+fn a_finished_recipe_opens_while_others_are_still_checked_but_a_run_waits() {
     let e = env();
-    // About 5 s unoptimised here; the menu shows "Time steps" within milliseconds of it starting,
-    // and recipe results only change inside `tick`, so `busy()` below is exact.
+    // About 5 s unoptimised here, so it is still running when "Time steps" is done. The screen
+    // is one string of 120-column rows, so a row's text is what follows its name, up to the
+    // next row. Recipe results only change inside `tick`, so `busy()` below is exact.
     let sl = slow(6_000_000);
     let mut a = app_with(&e, "proj", recipes(&e, &[BIG, ("slow.sql", &sl)]));
-    key(&mut a, KeyCode::Char('C'));
-    // Wait for the first recipe while the slow one is still running.
+    key(&mut a, KeyCode::Char('c'));
+    let steps_done = |s: &str| {
+        s.find("Time steps").is_some_and(|p| {
+            !s[p..]
+                .chars()
+                .take(100)
+                .collect::<String>()
+                .contains("looking")
+        })
+    };
     let t = Instant::now();
-    while !(a.mode == Mode::Menu && screen(&mut a).contains("Time steps")) {
+    while !(a.mode == Mode::Menu && steps_done(&screen(&mut a))) {
         assert!(t.elapsed() < Duration::from_secs(20), "no menu");
         a.tick();
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(a.busy(), "the slow recipe finished too soon for this test");
+    // The finished recipe can be opened at once.
     key(&mut a, KeyCode::Enter);
-    assert_eq!(a.mode, Mode::Menu, "no choosing while recipes are checked");
+    assert_eq!(
+        a.mode,
+        Mode::Paths,
+        "a finished recipe opens while others run"
+    );
+    key(&mut a, KeyCode::Enter);
+    // A run waits for the checks to finish.
+    key(&mut a, KeyCode::Char('y'));
+    assert_eq!(a.mode, Mode::Confirm, "no run while recipes are checked");
     let s = screen(&mut a);
     assert!(s.contains("Still checking recipes — one moment…"), "{s}");
-    settle(&mut a);
+    // Back to the menu, and wait for the slow recipe there.
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Esc);
     assert_eq!(a.mode, Mode::Menu);
+    let slow_done = |s: &str| {
+        s.find("Zz slow").is_some_and(|p| {
+            !s[p..]
+                .chars()
+                .take(100)
+                .collect::<String>()
+                .contains("looking")
+        })
+    };
+    let t = Instant::now();
+    while !slow_done(&screen(&mut a)) {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "slow recipe never finished"
+        );
+        a.tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!a.busy());
     key(&mut a, KeyCode::Enter);
-    assert_eq!(a.mode, Mode::Paths);
     key(&mut a, KeyCode::Enter);
     key(&mut a, KeyCode::Char('y'));
     let s = settle(&mut a);
