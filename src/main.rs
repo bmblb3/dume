@@ -1,7 +1,9 @@
 use clap::Parser;
-use dumelib::{bench, db, report, scan};
-use std::io::{BufWriter, IsTerminal};
-use std::path::PathBuf;
+use dumelib::{bench, db, recipe, report, scan};
+use std::ffi::OsStr;
+use std::io::{BufWriter, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[global_allocator]
@@ -14,13 +16,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(name = "dume-scan", version, max_term_width = 100)]
 struct Cli {
     /// Directory to scan (never crosses into other filesystems or follows symlinks)
-    #[arg(required_unless_present = "json")]
+    #[arg(required_unless_present_any = ["json", "find"])]
     dir: Option<PathBuf>,
     /// Number of concurrent threads
     #[arg(short = 'j', long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..))]
     threads: u16,
     /// Owner uid to keep (default: your own uid)
-    #[arg(short, long, conflicts_with_all = ["merge", "report", "json"])]
+    #[arg(short, long, conflicts_with_all = ["merge", "report", "json", "find"])]
     uid: Option<u32>,
     /// Scan DIR into the database FILE instead of printing JSON
     #[arg(short, long, value_name = "FILE", conflicts_with_all = ["merge", "report", "json"])]
@@ -43,6 +45,10 @@ struct Cli {
     /// With --bench: recipes evaluated at once in the parallel pass
     #[arg(long, default_value_t = 4, requires = "bench", value_parser = clap::value_parser!(u16).range(1..))]
     parallel: u16,
+    /// Don't scan: list the files under DIR [default: .] whose name matches REGEX, newest first
+    #[arg(long, num_args = 2, value_names = ["REGEX", "FILE"],
+          conflicts_with_all = ["merge", "report", "json", "output", "bench"])]
+    find: Vec<String>,
     /// Rows per section in --report
     #[arg(short = 'n', long, default_value_t = 15, requires = "report")]
     top: usize,
@@ -62,6 +68,7 @@ fn main() -> ExitCode {
         && cli.bench.is_none()
         && cli.report.is_none()
         && cli.output.is_none()
+        && cli.find.is_empty()
         && std::io::stdout().is_terminal()
     {
         eprintln!(
@@ -86,7 +93,12 @@ fn run(cli: &Cli) -> std::io::Result<()> {
         let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
         return db::Db::open_ro(file)?.write_json(&mut out);
     }
-    let given = cli.dir.as_ref().expect("clap requires DIR without --json");
+    let cwd = PathBuf::from(".");
+    let given = match &cli.dir {
+        Some(d) => d,
+        None if !cli.find.is_empty() => &cwd,
+        None => unreachable!("clap requires DIR without --json or --find"),
+    };
     let fail =
         |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", given.display()));
     // dume never follows symlinks, DIR itself included: name the real directory instead.
@@ -113,6 +125,11 @@ fn run(cli: &Cli) -> std::io::Result<()> {
             cli.top,
             &mut std::io::stdout().lock(),
         );
+    }
+    if let [re, file] = &cli.find[..] {
+        let d = db::Db::open_ro(Path::new(file))?;
+        let mut out = BufWriter::new(std::io::stdout().lock());
+        return find(&d, dir, re, &mut out);
     }
     if let Some(file) = &cli.bench {
         return bench::run(
@@ -155,6 +172,61 @@ fn run(cli: &Cli) -> std::io::Result<()> {
     let root = given.to_string_lossy();
     scan.write(&mut out, &root, dev, uid, env!("CARGO_PKG_VERSION"))?;
     summary(scan.files, scan.errors, uid, true)
+}
+
+/// `--find`: files under `dir` whose name matches `re`, newest first (unknown mtime last).
+/// Runs as a recipe, so it gets the same read-only, scoped, time-limited query.
+fn find(d: &db::Db, dir: &Path, re: &str, out: &mut impl Write) -> std::io::Result<()> {
+    regex::bytes::Regex::new(re).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--find: {e}"))
+    })?;
+    let r = recipe::Recipe {
+        name: "--find".into(),
+        apply: recipe::Apply::Delete,
+        sql: format!(
+            "SELECT path FROM entries WHERE NOT is_dir AND name REGEXP '{}'",
+            re.replace('\'', "''")
+        ),
+        file: PathBuf::new(),
+    };
+    let mut hits = recipe::select(d, &r, dir)
+        .map_err(|e| std::io::Error::other(format!("--find: {e}")))?
+        .hits;
+    hits.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+    let root = d.meta()?.root;
+    let mut total = 0;
+    for h in &hits {
+        total += h.size;
+        let when = h.mtime.map_or_else(|| "-".into(), utc);
+        write!(out, "{when:<16}  {:>10}  ", report::human(h.size))?;
+        out.write_all(root.join(OsStr::from_bytes(&h.path)).as_os_str().as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
+    let n = hits.len();
+    eprintln!(
+        "dume-scan: {n} {}, {} (times in UTC)",
+        if n == 1 { "file" } else { "files" },
+        report::human(total)
+    );
+    Ok(())
+}
+
+/// `secs` since the epoch as `YYYY-MM-DD HH:MM` in UTC (civil_from_days, H. Hinnant).
+fn utc(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64 + 719_468, secs % 86_400);
+    let (era, doe) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 fn progress_errors(p: &scan::Progress) -> u64 {

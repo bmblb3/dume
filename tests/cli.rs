@@ -810,3 +810,47 @@ fn symlinked_dir_argument_is_refused_with_the_real_directory_named() {
     let (c, _, e) = run(&[link.join("a").to_str().unwrap()]);
     assert_eq!(c, 0, "{e}");
 }
+
+#[test]
+fn find_lists_matching_files_newest_first() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    fs::create_dir_all(p.join("proj/Audi_dir.ansa")).unwrap();
+    fs::create_dir_all(p.join("other")).unwrap();
+    let at = |rel: &str, secs: u64| {
+        let f = fs::File::create(p.join(rel)).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    at("proj/Audi_A4.ansa", 1_000_000_000);
+    at("proj/Volkswagen_Golf.ansa", 1_700_000_000);
+    at("proj/Audi_A4.txt", 1_800_000_000);
+    at("proj/Audi_dir.ansa/inner.ansa", 1_800_000_000);
+    at("other/Audi_old.ansa", 1_800_000_000);
+    let out = tempfile::tempdir().unwrap();
+    let f = out.path().join("dume.db");
+    export(p, &f);
+    let (f, proj) = (f.to_str().unwrap(), p.join("proj"));
+    let re = r"(Audi|Volkswagen).*\.ansa$";
+
+    // Files only (not the matching folder), scoped to DIR, newest first, UTC dates.
+    let (c, out, e) = run(&[proj.to_str().unwrap(), "--find", re, f]);
+    assert_eq!(c, 0, "{e}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(lines[0].starts_with("2023-11-14 22:13"), "{out}");
+    assert!(lines[0].ends_with("/proj/Volkswagen_Golf.ansa"), "{out}");
+    assert!(lines[1].starts_with("2001-09-09 01:46"), "{out}");
+    assert!(lines[1].ends_with("/proj/Audi_A4.ansa"), "{out}");
+    assert!(e.contains("2 files"), "{e}");
+
+    // DIR defaults to the current directory.
+    let (c, out2, e) = run_in(&proj, &["--find", re, f]);
+    assert_eq!(c, 0, "{e}");
+    assert_eq!(out2, out);
+
+    // A bad regex is an error, not an empty list.
+    let (c, _, e) = run(&[proj.to_str().unwrap(), "--find", "*(Audi)", f]);
+    assert_eq!(c, 1);
+    assert!(e.contains("--find"), "{e}");
+}

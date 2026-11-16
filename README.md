@@ -128,11 +128,13 @@ dume-scan /data -o dume.db                  # scan into a database
 dume-scan --json dume.db | ncdu -f-         # database -> ncdu JSON
 dume-scan /data/proj/old -m dume.db         # rescan one dir, update the database in place
 dume-scan /data/proj -r dume.db             # text report; no scan
+dume-scan /data/proj --find '(Audi|Volkswagen).*\.ansa$' dume.db   # matching files, newest first; no scan
 dume-scan /data/proj --bench dume.db --actions PREFIX/share/dume/actions   # where does `c` spend its time?
 ```
 
 ```
 dume-scan <DIR> [-j THREADS] [-u UID] [-o FILE | -m FILE | -r FILE [-n N]] [-v]
+dume-scan [DIR] --find REGEX FILE
 dume-scan --json FILE
 ```
 
@@ -144,6 +146,7 @@ dume-scan --json FILE
 | `--json FILE` | off | print the database `FILE` as ncdu JSON (no `DIR`) |
 | `-m, --merge FILE` | off | rescan `DIR` and update the database `FILE` in place |
 | `-r, --report FILE` | off | no scan: print what takes space under `DIR`, from a database |
+| `--find REGEX FILE` | off | no scan: list your files under `DIR` (default: the current directory) whose name matches `REGEX`, newest first: modified time (UTC), size, path. Same query limits as recipes; folders are not listed |
 | `-n, --top` | 15 | rows per `--report` section |
 | `--bench FILE` | off | no scan write: time a scan of `DIR` and each recipe in `--actions DIR` (one at a time, then `--parallel N` at once, default 4); read-only |
 | `-v, --verbose` | off | print each unreadable path (default: just a count) |
